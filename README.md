@@ -14,6 +14,70 @@ What happens when you run it:
 
 All pipeline state and artifacts are stored under `$XPATCHER_HOME/.xpatcher/`, keeping the target repository clean — only the actual code changes, commits, and branches land there.
 
+## Pipeline
+
+```mermaid
+flowchart TD
+    start(["Feature Request"]) --> s1
+
+    subgraph spec ["SPECIFICATION"]
+        s1["1. Intent Capture"] --> s2["2. Spec Draft"] --> s3["3. Spec Review"]
+        s3 -->|"needs changes"| s4["4. Spec Fix"]
+        s4 -->|"max 3"| s3
+        s3 -->|"approved"| s5{{"5. Approve (human gate)"}}
+    end
+
+    s5 --> s6
+
+    subgraph plan ["TASK PLANNING"]
+        s6["6. Task Breakdown"] --> s7["7. Task Review"]
+        s7 -->|"needs changes"| s8["8. Task Fix"]
+        s8 -->|"max 3"| s7
+        s7 -->|"approved"| s9["9. Prioritize + DAG"] --> s10["10. Execution Graph"]
+    end
+
+    s10 --> s11
+
+    subgraph exec ["EXECUTION · per task · topo order"]
+        s11["11. Execute"] --> tests["Acceptance Tests"] --> s12["12. Code Review"]
+        s12 -->|"request fix"| s13["13. Fix"]
+        s13 -->|"max 3"| s12
+        s12 -->|"pass"| taskdone(["Task done"])
+    end
+
+    taskdone --> s14
+
+    subgraph verify ["VERIFICATION"]
+        s14["14. Gap Detection"]
+        s14 -->|"complete"| s15["15. Documentation"] --> s16{{"16. Complete (human gate)"}}
+    end
+
+    s14 -.->|"gaps found (max 2 re-entries)"| s6
+    s16 --> finish(["Reviewed & tested code on branch"])
+```
+
+### Agents
+
+| Agent | Model | Stages | Role |
+|-------|-------|--------|------|
+| Planner | Opus (1M) | 1, 2, 4, 6, 8 | Requirements, specs, task decomposition |
+| Reviewer | Opus | 3, 7, 12 | Adversarial review (isolated from executor) |
+| Executor | Sonnet | 11, 13 | Code implementation and fixes |
+| Gap Detector | Opus | 14 | Spec-to-code completeness analysis |
+| Tech Writer | Sonnet | 15 | Documentation updates |
+| Dispatcher | Python | 5, 9, 10, 16 | Orchestration, DAG scheduling, gates |
+
+### Self-Correction Limits
+
+| Loop | Max | On Limit |
+|------|-----|----------|
+| Spec review (3-4) | 3 | Escalate to human |
+| Task review (7-8) | 3 | Escalate to human |
+| Quality loop (12-13) | 3 | Mark task stuck, continue |
+| Gap re-entry (14-6) | 2 | Escalate to human |
+
+Oscillation detection: if the same findings recur across iterations, escalate immediately rather than burning remaining iterations.
+
 ## Requirements
 
 - Python 3.10+
