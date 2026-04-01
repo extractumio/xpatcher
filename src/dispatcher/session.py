@@ -356,8 +356,9 @@ class SessionRecord:
 class SessionRegistry:
     """Tracks sessions across agent invocations for reuse and context bridging."""
 
-    def __init__(self, registry_path: Path):
+    def __init__(self, registry_path: Path, abandon_threshold_pct: int = 90):
         self.registry_path = registry_path
+        self._abandon_threshold = abandon_threshold_pct / 100.0
         self._sessions: dict[str, SessionRecord] = {}
         self._load()
 
@@ -392,9 +393,8 @@ class SessionRegistry:
         """Find a reusable session. Returns None if context likely exhausted."""
         for sid, rec in self._sessions.items():
             if rec.agent_type == agent_type and rec.task_id == task_id:
-                # Don't reuse if context > 90% (abandon threshold)
                 context_limit = 1_000_000 if "[1m]" in agent_type else 200_000
-                if rec.token_estimate > context_limit * 0.9:
+                if rec.token_estimate > context_limit * self._abandon_threshold:
                     continue
                 return sid
         return None

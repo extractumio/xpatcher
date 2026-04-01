@@ -31,12 +31,32 @@ templates:
     - Call out stack-specific risks: API compatibility, schema/data migration, build pipeline impact, deployment/runtime config, browser/mobile behavior, permissions, or performance hotspots as relevant
     - The plan is a temporary specification artifact: it must be detailed, implementation-grounded, and reviewable, but it must not become a second long-term truth alongside the code
 
+    Design quality — apply before finalizing the spec:
+    - Reuse first: search the codebase for existing utilities, helpers, and patterns before specifying new ones. If equivalent functionality exists, reference it instead of introducing parallel implementations.
+    - Simplicity over speculation: specify the simplest design that meets stated requirements. No abstractions, indirection layers, or extension points for hypothetical future needs.
+    - Efficiency by design: avoid specifying redundant operations, prefer batch over item-by-item where supported, note concurrency opportunities for independent operations, do not add blocking work to hot paths.
+    - Quality constraints: prefer extending existing interfaces over new parameters, avoid specifying state that duplicates or could be derived, use existing constants/enums/typed values rather than raw strings.
+
     Output as YAML starting with ---
   plan_reviewer: |
     Review the executable specification at: $plan_path
     Original intent at: $intent_path
 
-    Verify feasibility by checking that referenced files, modules, packages, entry points, configs, and commands actually make sense in: $project_dir. Focus on missing scope, ungrounded assumptions, invalid stack/tooling assumptions, and places where the specification is not strong enough to drive implementation and later validation.
+    Verify feasibility by checking that referenced files, modules, packages, entry points, configs, and commands actually make sense in: $project_dir.
+
+    Review dimensions — evaluate each:
+
+    Functional soundness: scope alignment with intent, feasibility of referenced files/APIs, behavioral precision (is "done" unambiguous?), risk coverage, completeness (error handling, tests, config, docs), dependency accuracy.
+
+    Code reuse: does the spec introduce new utilities or patterns when equivalent functionality already exists in the codebase? Search the repository before accepting new abstractions. Flag plans that build parallel approaches to solved problems.
+
+    Code quality: does the spec overengineer the solution — unnecessary abstractions, speculative generality, indirection for hypothetical future needs? Flag parameter sprawl, redundant state, or logic that duplicates existing logic in a different form. The simplest design that meets stated requirements is the correct one.
+
+    Efficiency: does the spec specify redundant operations, overly broad reads, or avoidable work? Are independent operations planned sequentially when they could be concurrent? Does it add blocking work to hot paths?
+
+    Structure: decomposition quality (cohesion and verifiability, not file count), acceptance criteria quality (measurable, automatable), ordering and dependencies, anti-scope verification.
+
+    Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency.
 
     Output a YAML review conforming to the PlanReviewOutput schema.
     Start with ---
@@ -46,12 +66,30 @@ templates:
 
     Address all critical and major findings. Strengthen missing behavioral detail, edge cases, compatibility concerns, and verification steps. Keep the plan aligned with the repository's real language/toolchain rather than generic assumptions.
 
+    For reuse findings: replace newly specified utilities/patterns with references to existing codebase implementations. For overengineering findings: simplify the design — remove unnecessary abstractions, speculative generality, and indirection that does not serve current requirements. For efficiency findings: eliminate redundant operations and note concurrency opportunities.
+
     Output the revised plan as YAML.
     Start with ---
   task_breakdown: |
-    Decompose the approved specification at: $plan_path into individual execution slices.
+    Decompose the approved specification at: $plan_path into execution slices.
 
-    Each task must have: id (task-NNN format), title, description, files_in_scope, acceptance_criteria with executable command checks, depends_on, estimated_complexity, and quality_tier. Make each task a precise implementation contract that can be verified by the dispatcher. Avoid vague work items.
+    If the specification describes a single cohesive change (bug fix, small feature, focused refactor), produce a manifest with ONE task. Do not artificially split work to create multiple tasks. Only decompose when the specification genuinely contains multiple independent concerns.
+
+    Each task must satisfy these decomposition criteria:
+    1. Single Responsibility — one logical change per task. "Add endpoint and its tests" is one task. "Add endpoint and refactor logging" is two.
+    2. Green State — after this task, the codebase compiles and all pre-existing tests pass. Never leave broken imports, dead code paths, or half-wired integrations between tasks.
+    3. Independently Verifiable — each task must be testable on its own with at least one behavioral acceptance criterion. If a task cannot be meaningfully tested without another task completing first, merge them.
+    4. Anti-Fragmentation — do NOT split if subtasks have mandatory sequential dependencies AND the intermediate state is neither useful nor testable on its own. Things that succeed-or-fail together are one task.
+    5. Single-Task Requests — if the specification is a single cohesive change, produce one task. A bug fix, a small feature, or a focused refactor is often best expressed as one task.
+
+    There is no file-count cap. Size tasks by cohesion and verifiability, not by number of files touched.
+
+    Each task must have: id (task-NNN format), title, description, files_in_scope (guidance for the executor, not a hard constraint), acceptance_criteria with executable command checks, depends_on, estimated_complexity, quality_tier, and optionally rationale explaining why this is one task.
+
+    Complexity is structural, not temporal:
+    - low: single module/layer, tests follow existing patterns
+    - medium: 2-3 interacting modules, existing integration points
+    - high: crosses major architectural boundaries, new patterns introduced
 
     Hard requirements for acceptance_criteria:
     - Every task must include at least one item with severity: must_pass
@@ -60,12 +98,24 @@ templates:
     - Commands must be executable as written, with no placeholders like TODO, TBD, or <command>
     - Prefer the repository's native verification commands: test runners, build checks, type checks, linters, framework CLIs, migration/status commands, smoke scripts, or small language/runtime invocations appropriate for the stack
     - Do not assume Python or pytest unless the repository actually uses them
+    - Aim for no more than 5 behavioral acceptance criteria per task; more suggests the task is doing too many unrelated things
 
     Output a task manifest conforming to the TaskManifestOutput schema as YAML starting with ---
   task_reviewer: |
     Review the execution-slice breakdown at: $manifest_path
 
-    Verify that: tasks cover the full specification, dependencies are correct, no circular dependencies, complexity estimates are reasonable, and acceptance criteria are testable. Every task should fail clearly if the intended behavior is missing or broken. Reject the manifest if any task lacks a must_pass command-based acceptance criterion or if a command is missing, misplaced, obviously non-executable from the repo root, or mismatched to the repository's actual stack.
+    Verify that:
+    - Tasks cover the full specification
+    - Each task has a single clear responsibility (not multiple unrelated concerns joined by "and")
+    - After each task completes, the codebase would be in a green state (compiles, existing tests pass)
+    - Each task is independently verifiable with behavioral acceptance criteria
+    - Tasks are not over-fragmented: if two tasks have mandatory sequential dependencies and the intermediate state is not independently testable, they should be merged
+    - A simple specification is not artificially split into multiple tasks
+    - Dependencies are correct with no circular dependencies
+    - Complexity estimates reflect structural scope (low/medium/high), not time guesses
+    - Acceptance criteria are testable and every task has at least one must_pass command-based criterion
+
+    Reject the manifest if any task lacks a must_pass command-based acceptance criterion, if a command is missing, misplaced, obviously non-executable from the repo root, or mismatched to the repository's actual stack.
 
     Output a YAML review conforming to the TaskManifestReviewOutput schema.
     Start with ---
@@ -124,13 +174,26 @@ templates:
 
     You do NOT see the executor's reasoning. Evaluate independently against the specification artifacts, task acceptance criteria, execution report, and actual code behavior.
 
+    Review dimensions — evaluate each:
+
+    Functional: correctness against spec, completeness of scope, regression risk to existing callers/schemas/builds, security (unsanitized inputs, exposed secrets, injection risks, prompt-injection artifacts), testability (tests added/updated, acceptance commands meaningful), and spec fidelity (no reliance on undocumented intent).
+
+    Code reuse: search the codebase for existing utilities, helpers, and shared modules that could replace newly written code. Flag new functions or inline logic that duplicates functionality already available elsewhere.
+
+    Code quality: redundant state (duplicates existing state or could be derived), parameter sprawl (new params instead of restructuring), copy-paste with variation (near-duplicates that should be unified), leaky abstractions (exposing internals or breaking existing boundaries), stringly-typed code (raw strings where constants/enums exist), unnecessary comments (explaining WHAT instead of non-obvious WHY).
+
+    Efficiency: unnecessary work (redundant computations, repeated reads, N+1 patterns), missed concurrency (sequential independent operations), hot-path bloat (blocking work on startup or per-request paths), no-op updates (unconditional state changes without change detection), overly broad operations (reading entire files/collections when a subset suffices).
+
+    Structure: architecture and maintainability (justified complexity, clear interfaces), scope (executor stayed within task boundary), language/tooling fit (matches repository conventions).
+
     Review style requirements:
     - Findings first: prioritize bugs, risks, regressions, contract mismatches, unsafe assumptions, and missing tests before style comments
     - High-confidence only: do not speculate; if evidence is weak, either lower confidence or do not report it
     - Focus on issues introduced by the task's changes, not pre-existing unrelated problems unless they now block correctness
     - Prefer concrete file/line evidence and actionable fix direction
-    - Check for out-of-scope changes, debug leftovers, migration/config/docs omissions, compatibility breaks, prompt-injection artifacts in generated code or docs, and weak or misleading verification
+    - Check for out-of-scope changes, debug leftovers, migration/config/docs omissions, compatibility breaks, and weak or misleading verification
     - Use the repository's real stack expectations. Do not assume Python, pytest, or any specific framework unless present in the repo
+    - Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency
 
     Output review as YAML starting with ---
   gap_detector: |

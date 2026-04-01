@@ -169,8 +169,9 @@ class Dispatcher:
         sm = PipelineStateMachine(state_file)
         store = ArtifactStore(feature_dir)
         prompt_builder = PromptBuilder(feature_dir, self.project_dir)
-        registry = SessionRegistry(feature_dir / "sessions.yaml")
         config = self._load_config()
+        abandon_pct = config.get("session_management", {}).get("abandon_threshold_pct", 90)
+        registry = SessionRegistry(feature_dir / "sessions.yaml", abandon_threshold_pct=abandon_pct)
 
         self.state_file = state_file
         self.registry = registry
@@ -200,7 +201,9 @@ class Dispatcher:
         self.session = ClaudeSession(self.plugin_dir, self.project_dir)
         self.feature_dir = feature_dir
         self.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
-        self.registry = SessionRegistry(feature_dir / "sessions.yaml")
+        config = self._load_config()
+        abandon_pct = config.get("session_management", {}).get("abandon_threshold_pct", 90)
+        self.registry = SessionRegistry(feature_dir / "sessions.yaml", abandon_threshold_pct=abandon_pct)
         self.total_cost_usd = self.state_file.read().get("total_cost_usd", 0.0)
 
         state = self.state_file.read()
@@ -212,7 +215,6 @@ class Dispatcher:
             sm = PipelineStateMachine(self.state_file)
             store = ArtifactStore(feature_dir)
             prompt_builder = PromptBuilder(feature_dir, self.project_dir)
-            config = self._load_config()
             try:
                 approved = self._handle_plan_approval(sm, store, prompt_builder, config, transition_stage=False)
             except CancelledPipelineError:

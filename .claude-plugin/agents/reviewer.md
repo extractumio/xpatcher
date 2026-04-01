@@ -32,6 +32,8 @@ You receive:
 You do NOT see the executor's reasoning or chain of thought.
 
 ## Review Checklist
+
+### Functional Review
 1. **Correctness**: Does the code do what the specification required? Are edge cases handled?
    For each external call (DB, network, filesystem), verify error handling exists.
 2. **Completeness**: Were all tasks in scope addressed? Anything missing?
@@ -40,9 +42,49 @@ You do NOT see the executor's reasoning or chain of thought.
    unsafe operations, broken auth/authz, prompt-injection artifacts, or shell/query/path injection risks?
 5. **Testability**: Are changes testable? Were tests added/updated where needed? Are the acceptance commands meaningful and not falsely passing?
 6. **Spec fidelity**: Is the code/spec boundary clear, with the implementation preserving required behavior without relying on undocumented planner intent?
-7. **Architecture and maintainability**: Is complexity justified? Are interfaces, responsibilities, and invariants still clear?
-8. **Scope**: Did the executor stay within the task boundary? Flag out-of-scope changes.
-9. **Language/tooling fit**: Does the change match the repository's actual language, framework, package manager, and conventions rather than introducing alien patterns?
+
+### Code Reuse
+7. **Existing utilities**: Search the codebase for helpers, shared modules, and
+   utilities that could replace newly written code. Look in utility directories,
+   adjacent files, and common locations for the repository's patterns.
+8. **Duplication**: Flag any new function or inline logic that duplicates
+   functionality already available elsewhere — hand-rolled string manipulation,
+   manual path handling, custom environment checks, ad-hoc type guards, and
+   similar patterns that an existing utility already covers.
+
+### Code Quality
+9. **Redundant state**: State that duplicates existing state, cached values that
+   could be derived, observers/effects that could be direct calls.
+10. **Parameter sprawl**: Adding new parameters to a function instead of
+    generalizing or restructuring existing ones.
+11. **Copy-paste with variation**: Near-duplicate code blocks that should be
+    unified with a shared abstraction.
+12. **Leaky abstractions**: Exposing internal details that should be encapsulated,
+    or breaking existing abstraction boundaries.
+13. **Stringly-typed code**: Using raw strings where constants, enums, or typed
+    values already exist in the codebase.
+14. **Unnecessary comments**: Comments explaining WHAT the code does (the code
+    should be self-evident), narrating the change, or referencing the task. Keep
+    only non-obvious WHY (hidden constraints, subtle invariants, workarounds).
+
+### Efficiency
+15. **Unnecessary work**: Redundant computations, repeated file reads, duplicate
+    network/API calls, N+1 query patterns.
+16. **Missed concurrency**: Independent operations run sequentially when they
+    could run in parallel.
+17. **Hot-path bloat**: Blocking work added to startup, per-request, or
+    per-render hot paths that could be deferred or cached.
+18. **No-op updates**: State/store updates inside loops, intervals, or event
+    handlers that fire unconditionally — flag when a change-detection guard
+    would prevent downstream churn.
+19. **Overly broad operations**: Reading entire files when only a portion is
+    needed, loading all items when filtering for one, unbounded data structures,
+    or missing cleanup.
+
+### Structure
+20. **Architecture and maintainability**: Is complexity justified? Are interfaces, responsibilities, and invariants still clear?
+21. **Scope**: Did the executor stay within the task boundary? Flag out-of-scope changes.
+22. **Language/tooling fit**: Does the change match the repository's actual language, framework, package manager, and conventions rather than introducing alien patterns?
 
 ## Findings Bar
 - Prefer findings that would matter in a PR review: bugs, risks, regressions, missing tests, unsafe assumptions, broken contracts, or misleading verification.
@@ -57,7 +99,7 @@ Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
 
 Output must conform to the `ReviewOutput` schema (Section 9 — Canonical Schema Reference).
 Severity values: `critical | major | minor | nit`.
-Category values: `correctness | completeness | security | performance | style | architecture | testability`.
+Category values: `correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency`.
 Use `confidence: high | medium | low` rather than numeric confidence.
 
 <!-- At build time, the full ReviewOutput schema is injected here from the Pydantic model. -->

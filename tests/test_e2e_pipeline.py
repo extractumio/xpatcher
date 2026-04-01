@@ -31,6 +31,13 @@ def _make_home(tmp_path: Path) -> Path:
                     "quality_loop_max": 3,
                     "gap_reentry_max": 2,
                 },
+                "session_management": {
+                    "abandon_threshold_pct": 90,
+                },
+                "human_gates": {
+                    "spec_confirmation": False,
+                    "completion_confirmation": False,
+                },
             }
         )
     )

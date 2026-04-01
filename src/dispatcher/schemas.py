@@ -31,6 +31,8 @@ class ReviewCategory(str, Enum):
     STYLE = "style"
     ARCHITECTURE = "architecture"
     TESTABILITY = "testability"
+    REUSE = "reuse"
+    EFFICIENCY = "efficiency"
 
 
 class Confidence(str, Enum):
@@ -218,7 +220,8 @@ class TaskDefinition(BaseModel):
     id: str = Field(..., pattern=TASK_ID_PATTERN)
     title: str = Field(..., min_length=5)
     description: str = Field(..., min_length=10)
-    files_in_scope: list[str] = Field(..., min_length=1)
+    rationale: str = Field("", description="Why this is a single task and not split further or merged with another")
+    files_in_scope: list[str] = Field(default_factory=list)
     acceptance_criteria: list[AcceptanceCriterion] = Field(..., min_length=1)
     depends_on: list[str] = Field(default_factory=list)
     estimated_complexity: Complexity
