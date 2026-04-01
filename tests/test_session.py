@@ -84,6 +84,7 @@ class TestClaudeSessionInvoke:
         cmd = mock_run.call_args[0][0]
         assert cmd == [
             "claude",
+            "--bare",
             "-p",
             "do stuff",
             "--output-format",

@@ -2,6 +2,7 @@ agents:
   planner:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -20,6 +21,7 @@ agents:
   plan_reviewer:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -38,6 +40,7 @@ agents:
   executor:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -56,6 +59,7 @@ agents:
   reviewer:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -74,6 +78,7 @@ agents:
   tester:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -92,6 +97,7 @@ agents:
   simplifier:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -110,6 +116,7 @@ agents:
   gap_detector:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -128,6 +135,7 @@ agents:
   tech_writer:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"
@@ -146,6 +154,7 @@ agents:
   explorer:
     command:
       - claude
+      - "--bare"
       - "-p"
       - "{prompt}"
       - "--output-format"

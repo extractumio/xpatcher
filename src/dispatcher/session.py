@@ -87,7 +87,7 @@ class ClaudeSession:
     def preflight(self) -> PreflightResult:
         """Verify Claude Code CLI is authenticated, responsive, and plugin loaded."""
         cmd = [
-            "claude", "-p", "respond with ok",
+            "claude", "--bare", "-p", "respond with ok",
             "--output-format", "json",
             "--plugin-dir", str(self.plugin_dir),
             "--max-turns", "1",
@@ -196,7 +196,7 @@ class ClaudeSession:
     def _build_cmd_legacy(self, invocation: AgentInvocation) -> list[str]:
         """Build command from individual AgentInvocation fields (backward compat)."""
         cmd = [
-            "claude", "-p", invocation.prompt,
+            "claude", "--bare", "-p", invocation.prompt,
             "--output-format", "json",
             "--plugin-dir", str(self.plugin_dir),
             "--permission-mode", invocation.permission_mode,

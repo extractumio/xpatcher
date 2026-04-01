@@ -136,7 +136,7 @@ echo ""
 echo "Running smoke test..."
 SMOKE_OUTPUT=""
 SMOKE_EXIT=0
-SMOKE_OUTPUT=$(claude -p "respond with ok" --output-format json \
+SMOKE_OUTPUT=$(claude --bare -p "respond with ok" --output-format json \
     --plugin-dir "$INSTALL_DIR/.claude-plugin/" \
     --max-turns 1 --permission-mode bypassPermissions 2>&1) || SMOKE_EXIT=$?
 
@@ -194,23 +194,22 @@ print(f'[ok] Claude Code CLI v{version} -- plugin loaded as {plugin_name}, {len(
 fi
 
 # ---------------------------------------------------------------------------
-# 9. PATH setup instructions
+# 9. Add to PATH in shell rc files (idempotent, supports bash + zsh)
 # ---------------------------------------------------------------------------
-if [[ ":$PATH:" != *":$INSTALL_DIR/bin:"* ]]; then
-    echo ""
-    echo "------------------------------------------------------------"
-    echo "Add xpatcher to your PATH:"
-    echo ""
-    echo "  # For bash:"
-    echo "  echo 'export PATH=\"$INSTALL_DIR/bin:\$PATH\"' >> ~/.bashrc"
-    echo ""
-    echo "  # For zsh:"
-    echo "  echo 'export PATH=\"$INSTALL_DIR/bin:\$PATH\"' >> ~/.zshrc"
-    echo ""
-    echo "Then restart your shell or run:"
-    echo "  export PATH=\"$INSTALL_DIR/bin:\$PATH\""
-    echo "------------------------------------------------------------"
-fi
+PATH_LINE="export PATH=\"$INSTALL_DIR/bin:\$PATH\""
+
+for rcfile in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$rcfile" ] || continue
+    if ! grep -qF "$INSTALL_DIR/bin" "$rcfile"; then
+        printf '\n# xpatcher\n%s\n' "$PATH_LINE" >> "$rcfile"
+        echo "[ok] Added to PATH in $(basename "$rcfile")"
+    else
+        echo "[ok] PATH already configured in $(basename "$rcfile")"
+    fi
+done
+
+# Make it available in the current session too
+export PATH="$INSTALL_DIR/bin:$PATH"
 
 echo ""
 echo "Installation complete."
