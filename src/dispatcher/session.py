@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 import yaml
 
+from .auth import build_subprocess_env
 from .schemas import ArtifactValidator, ValidationResult
 from .yaml_utils import extract_yaml, load_yaml_file
 
@@ -75,10 +76,11 @@ class ClaudeSession:
         "xpatcher:explorer",
     ]
 
-    def __init__(self, plugin_dir: Path, project_dir: Path):
+    def __init__(self, plugin_dir: Path, project_dir: Path, auth_env: dict[str, str] | None = None):
         self.plugin_dir = plugin_dir
         self.project_dir = project_dir
         self.plugin_name = self.PLUGIN_NAME
+        self._subprocess_env = build_subprocess_env(auth_env or {})
 
     def _required_agents(self, plugin_name: str | None = None) -> list[str]:
         active_name = plugin_name or self.plugin_name or self.PLUGIN_NAME
@@ -100,6 +102,7 @@ class ClaudeSession:
                 capture_output=True,
                 text=True,
                 timeout=self.PREFLIGHT_TIMEOUT_SEC,
+                env=self._subprocess_env,
             )
         except FileNotFoundError:
             return PreflightResult(
@@ -227,6 +230,7 @@ class ClaudeSession:
                 text=True,
                 timeout=invocation.timeout,
                 cwd=str(self.project_dir),
+                env=self._subprocess_env,
             )
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
@@ -238,6 +242,7 @@ class ClaudeSession:
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(self.project_dir),
+                env=self._subprocess_env,
                 start_new_session=True,
             )
             start = time.monotonic()

@@ -48,6 +48,16 @@ pytest -q
 xpatcher start "Add a farewell helper with tests"
 ```
 
+## Authentication
+
+`claude --bare` skips Keychain/OAuth auto-discovery. Auth is handled by `src/dispatcher/auth.py` (single source of truth — install.sh delegates to it too):
+
+1. `ANTHROPIC_API_KEY` from `$XPATCHER_HOME/.env`
+2. `ANTHROPIC_API_KEY` in inherited environment
+3. OAuth access token from Keychain (macOS) or `~/.claude/.credentials.json` (Linux) — passed as `ANTHROPIC_API_KEY` (API routes by token prefix)
+
+Both installer and dispatcher fail fast if no auth resolves. The `.env` file is gitignored.
+
 ## Key Rules
 
 - **The codebase is the source of truth** -- not the design docs, not the proposals, not the reviews

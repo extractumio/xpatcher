@@ -84,6 +84,22 @@ Oscillation detection: if the same findings recur across iterations, escalate im
 - Claude Code CLI installed and authenticated
 - A git repository to run pipelines against
 
+## Authentication
+
+xpatcher uses `claude --bare` for all agent invocations, which requires explicit credentials. Two methods are supported (checked in this order):
+
+**1. API key** — add to `$XPATCHER_HOME/.env`:
+
+```
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+
+Also accepted via the `ANTHROPIC_API_KEY` environment variable.
+
+**2. Claude subscription (Pro/Max/Team/Enterprise)** — if no API key is found, xpatcher extracts the OAuth token from your logged-in Claude Code session (macOS Keychain or `~/.claude/.credentials.json`). Just run `claude` interactively once to log in.
+
+The installer and `xpatcher start`/`resume` will fail fast with a clear error if neither method resolves.
+
 ## Install
 
 Local editable-style usage:

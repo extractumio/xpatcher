@@ -13,6 +13,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .auth import resolve_auth_env, describe_auth_source
 from .state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
 from .session import AgentInvocation, AgentResult, ClaudeSession, MalformedOutputRecovery, SessionRegistry
 from .schemas import ArtifactValidator, ValidationResult
@@ -112,7 +113,8 @@ class Dispatcher:
         self.project_dir = project_dir
         self.xpatcher_home = xpatcher_home
         self.plugin_dir = xpatcher_home / ".claude-plugin"
-        self.session = ClaudeSession(self.plugin_dir, project_dir)
+        self._auth_env = resolve_auth_env(xpatcher_home)
+        self.session = ClaudeSession(self.plugin_dir, project_dir, self._auth_env)
         self.validator = ArtifactValidator()
         self.recovery = MalformedOutputRecovery(self.session, self.validator)
         self.tui = TUIRenderer()
@@ -120,6 +122,17 @@ class Dispatcher:
         self.state_file: PipelineStateFile | None = None
         self.registry: SessionRegistry | None = None
         self.feature_dir: Path | None = None
+
+    def _require_auth(self):
+        """Show auth source and abort if no credentials were resolved."""
+        env_has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        label = describe_auth_source(self._auth_env, env_has_key=env_has_key)
+        if label == "none":
+            self.tui.error("No authentication found. Cannot proceed.")
+            self.tui.info("  Either add ANTHROPIC_API_KEY to $XPATCHER_HOME/.env")
+            self.tui.info("  or log in interactively: run 'claude' and complete login")
+            sys.exit(1)
+        self.tui.success(f"Auth: {label}")
 
     def _feature_dir_for(self, feature_slug: str) -> Path:
         return self.xpatcher_home / ".xpatcher" / "projects" / _project_storage_slug(self.project_dir) / feature_slug
@@ -132,6 +145,7 @@ class Dispatcher:
             self.tui.error(f"Preflight failed: {preflight.error}")
             sys.exit(1)
         self.tui.success(f"Claude Code CLI v{preflight.cli_version} — plugin loaded")
+        self._require_auth()
 
         if not (self.project_dir / ".git").is_dir():
             self.tui.error("Not a git repository")
@@ -198,7 +212,7 @@ class Dispatcher:
 
         feature_dir = Path(record["feature_dir"])
         self.project_dir = Path(record["project_dir"])
-        self.session = ClaudeSession(self.plugin_dir, self.project_dir)
+        self.session = ClaudeSession(self.plugin_dir, self.project_dir, self._auth_env)
         self.feature_dir = feature_dir
         self.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
         config = self._load_config()
@@ -210,6 +224,7 @@ class Dispatcher:
         current = PipelineStage(state.get("current_stage", PipelineStage.UNINITIALIZED.value))
         gate_reason = state.get("gate_reason", "")
         self.tui.header(f"Resuming {pipeline_id}")
+        self._require_auth()
 
         if gate_reason == "plan_approval" and current in {PipelineStage.PAUSED, PipelineStage.PLAN_APPROVAL}:
             sm = PipelineStateMachine(self.state_file)

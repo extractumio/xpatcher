@@ -3,106 +3,107 @@
 #
 # This installer sets up xpatcher as a per-user installation. It is run
 # once and serves all projects.
-#
-# Steps:
-#   1. Check Python 3.10+
-#   2. Check Claude Code CLI
-#   3. Create installation directory
-#   4. Copy core files (plugin, src, config)
-#   5. Create venv, install deps (pydantic, pyyaml, rich)
-#   6. Create CLI entry point
-#   7. Create hook wrapper
-#   8. Smoke test: verify Claude Code CLI + plugin loading
-#   9. Print PATH setup instructions
 
 set -euo pipefail
 
 INSTALL_DIR="${XPATCHER_HOME:-$HOME/xpatcher}"
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
-echo "xpatcher installer"
-echo "====================="
-echo "Installing to: $INSTALL_DIR"
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+RESET="\033[0m"
+BOLD="\033[1m"
+DIM="\033[2m"
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+MAGENTA="\033[35m"
+CYAN="\033[36m"
+
+ok()   { printf "  ${GREEN}✓${RESET} %b\n" "$*"; }
+err()  { printf "  ${RED}✗${RESET} %b\n" "$*" >&2; }
+warn() { printf "  ${YELLOW}⚠${RESET} %b\n" "$*"; }
+info() { printf "  ${DIM}%b${RESET}\n" "$*"; }
+
+printf "\n${BOLD}${CYAN}  ╔══════════════════════════════════════╗${RESET}\n"
+printf "${BOLD}${CYAN}  ║         xpatcher installer            ║${RESET}\n"
+printf "${BOLD}${CYAN}  ╚══════════════════════════════════════╝${RESET}\n\n"
+info "Target: $INSTALL_DIR"
 echo ""
 
 # ---------------------------------------------------------------------------
 # 1. Check Python 3.10+
 # ---------------------------------------------------------------------------
 if ! command -v python3 &>/dev/null; then
-    echo "ERROR: Python 3 not found. Please install Python 3.10+"
+    err "Python 3 not found. Please install Python 3.10+"
     exit 1
 fi
 PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 PY_OK=$(python3 -c "import sys; print(int(sys.version_info >= (3, 10)))")
 if [ "$PY_OK" != "1" ]; then
-    echo "ERROR: Python 3.10+ required (found $PY_VERSION)"
+    err "Python 3.10+ required (found $PY_VERSION)"
     exit 1
 fi
-echo "[ok] Python $PY_VERSION"
+ok "Python $PY_VERSION"
 
 # ---------------------------------------------------------------------------
 # 2. Check Claude Code CLI
 # ---------------------------------------------------------------------------
 if ! command -v claude &>/dev/null; then
-    echo "ERROR: Claude Code CLI not found."
-    echo "  Install from: https://claude.ai/code"
+    err "Claude Code CLI not found."
+    info "Install from: https://claude.ai/code"
     exit 1
 fi
 CLAUDE_VERSION=$(claude --version 2>/dev/null || echo "unknown")
-echo "[ok] Claude Code CLI found ($CLAUDE_VERSION)"
+ok "Claude Code CLI ($CLAUDE_VERSION)"
 
 # ---------------------------------------------------------------------------
 # 3. Create installation directory
 # ---------------------------------------------------------------------------
 mkdir -p "$INSTALL_DIR"
-echo "[ok] Installation directory: $INSTALL_DIR"
+ok "Installation directory ready"
 
 # ---------------------------------------------------------------------------
 # 4. Copy core files
 # ---------------------------------------------------------------------------
-# Copy plugin directory (agents, hooks, skills, plugin.json, settings.json)
 cp -r "$SOURCE_DIR/.claude-plugin/" "$INSTALL_DIR/.claude-plugin/"
-
-# Copy Python source
 cp -r "$SOURCE_DIR/src/" "$INSTALL_DIR/src/"
-
-# Copy project metadata
 cp "$SOURCE_DIR/pyproject.toml" "$INSTALL_DIR/"
 
-# Copy config (prefer config.yaml, fall back to config.yaml.example)
 if [ -f "$SOURCE_DIR/config.yaml" ]; then
     cp "$SOURCE_DIR/config.yaml" "$INSTALL_DIR/"
 elif [ -f "$SOURCE_DIR/config.yaml.example" ]; then
     cp "$SOURCE_DIR/config.yaml.example" "$INSTALL_DIR/config.yaml"
 fi
 
-# Copy VERSION file
 if [ -f "$SOURCE_DIR/VERSION" ]; then
     cp "$SOURCE_DIR/VERSION" "$INSTALL_DIR/"
 fi
 
-echo "[ok] Core files installed"
+ok "Core files installed"
 
 # ---------------------------------------------------------------------------
 # 5. Create venv and install dependencies
 # ---------------------------------------------------------------------------
 if ! python3 -c "import venv" 2>/dev/null; then
-    echo "ERROR: Python venv module not found."
-    echo "  On Ubuntu/Debian: sudo apt install python3-venv"
-    echo "  On Fedora/RHEL:   sudo dnf install python3-venv"
-    echo "  On macOS:         venv is included with Python from python.org or brew"
+    err "Python venv module not found."
+    info "On Ubuntu/Debian: sudo apt install python3-venv"
+    info "On Fedora/RHEL:   sudo dnf install python3-venv"
+    info "On macOS:         venv is included with Python from python.org or brew"
     exit 1
 fi
 
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
-    echo "  Creating virtual environment..."
+    info "Creating virtual environment..."
     python3 -m venv "$INSTALL_DIR/.venv"
 fi
 
-echo "  Installing dependencies..."
+info "Installing dependencies..."
 "$INSTALL_DIR/.venv/bin/pip" install -q --upgrade pip 2>/dev/null
 "$INSTALL_DIR/.venv/bin/pip" install -q pydantic pyyaml rich
-echo "[ok] Dependencies installed"
+ok "Dependencies installed"
 
 # ---------------------------------------------------------------------------
 # 6. Create CLI entry point
@@ -115,7 +116,7 @@ export XPATCHER_HOME="$SCRIPT_DIR"
 exec "$SCRIPT_DIR/.venv/bin/python" -m src.dispatcher.core "$@"
 ENTRY
 chmod +x "$INSTALL_DIR/bin/xpatcher"
-echo "[ok] CLI entry point: $INSTALL_DIR/bin/xpatcher"
+ok "CLI entry point: ${DIM}$INSTALL_DIR/bin/xpatcher${RESET}"
 
 # ---------------------------------------------------------------------------
 # 7. Create hook wrapper
@@ -127,23 +128,69 @@ XPATCHER_HOME="$(cd "$HOOK_DIR/../.." && pwd -P)"
 exec "$XPATCHER_HOME/.venv/bin/python" "$HOOK_DIR/$1"
 HOOKWRAP
 chmod +x "$INSTALL_DIR/.claude-plugin/hooks/run_hook.sh"
-echo "[ok] Hook wrapper: $INSTALL_DIR/.claude-plugin/hooks/run_hook.sh"
+ok "Hook wrapper installed"
 
 # ---------------------------------------------------------------------------
-# 8. Smoke test: verify Claude Code CLI + plugin loading
+# 8. Resolve authentication for --bare mode
 # ---------------------------------------------------------------------------
 echo ""
-echo "Running smoke test..."
+printf "${BOLD}${BLUE}  Authentication${RESET}\n"
+
+# Delegate to the Python auth module (single source of truth)
+AUTH_RESULT=$("$INSTALL_DIR/.venv/bin/python" -c "
+import os, sys
+sys.path.insert(0, '$INSTALL_DIR')
+from src.dispatcher.auth import resolve_auth_env, describe_auth_source
+auth_env = resolve_auth_env(sys.path[0] and __import__('pathlib').Path('$INSTALL_DIR'))
+env_has_key = bool(os.environ.get('ANTHROPIC_API_KEY'))
+source = describe_auth_source(auth_env, env_has_key=env_has_key)
+key = auth_env.get('ANTHROPIC_API_KEY', '')
+print(f'{source}\n{key}')
+" 2>/dev/null || echo "none")
+
+AUTH_SOURCE=$(echo "$AUTH_RESULT" | head -1)
+_auth_key=$(echo "$AUTH_RESULT" | tail -1)
+
+AUTH_ENV=()
+if [ -n "$_auth_key" ] && [ "$_auth_key" != "$AUTH_SOURCE" ]; then
+    AUTH_ENV=(env ANTHROPIC_API_KEY="$_auth_key")
+fi
+
+if [ "$AUTH_SOURCE" = "none" ]; then
+    echo ""
+    err "${BOLD}No authentication found. Cannot proceed.${RESET}"
+    info "Either:"
+    info "  1. Add ${BOLD}ANTHROPIC_API_KEY=sk-ant-...${RESET} to ${BOLD}$INSTALL_DIR/.env${RESET}"
+    info "  2. Log in interactively: run ${BOLD}claude${RESET} and complete login"
+    echo ""
+    exit 1
+else
+    ok "Auth: ${BOLD}${MAGENTA}$AUTH_SOURCE${RESET}"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Smoke test: verify Claude Code CLI + plugin loading
+# ---------------------------------------------------------------------------
+echo ""
+printf "${BOLD}${BLUE}  Smoke Test${RESET}\n"
+
 SMOKE_OUTPUT=""
 SMOKE_EXIT=0
-SMOKE_OUTPUT=$(claude --bare -p "respond with ok" --output-format json \
+SMOKE_OUTPUT=$(${AUTH_ENV[@]+"${AUTH_ENV[@]}"} claude --bare -p "respond with ok" --output-format json \
     --plugin-dir "$INSTALL_DIR/.claude-plugin/" \
     --max-turns 1 --permission-mode bypassPermissions 2>&1) || SMOKE_EXIT=$?
 
 if [ "$SMOKE_EXIT" != "0" ]; then
-    echo "WARNING: Claude Code CLI smoke test failed (exit code $SMOKE_EXIT)"
-    echo "  Check that you are authenticated: run 'claude' interactively"
-    echo "  Installation succeeded but xpatcher may not work until this is resolved."
+    warn "Claude Code CLI smoke test failed (exit code $SMOKE_EXIT)"
+    if [ "$AUTH_SOURCE" = "none" ]; then
+        info "No credentials found. Either:"
+        info "  1. Add ANTHROPIC_API_KEY=sk-ant-... to $INSTALL_DIR/.env"
+        info "  2. Log in interactively: run 'claude' and complete login"
+    else
+        info "Auth ($AUTH_SOURCE) was detected but CLI still failed."
+        info "Check that your credentials are valid."
+    fi
+    warn "Installation succeeded but xpatcher may not work until this is resolved."
 else
     # Verify plugin loaded and agents registered by parsing the init event
 if echo "$SMOKE_OUTPUT" | "$INSTALL_DIR/.venv/bin/python" -c "
@@ -181,39 +228,48 @@ if not plugin:
 plugin_name = plugin.get('name', 'xpatcher')
 xp_agents = [a for a in agents if a.startswith(f'{plugin_name}:')]
 if len(xp_agents) < 9:
-    print(f'WARNING: Expected 9 xpatcher agents, found {len(xp_agents)}: {xp_agents}')
     sys.exit(1)
 
 print(f'[ok] Claude Code CLI v{version} -- plugin loaded as {plugin_name}, {len(xp_agents)} agents registered')
 " 2>/dev/null; then
         :  # Success message already printed
     else
-        echo "WARNING: Plugin verification could not be completed."
-        echo "  Installation succeeded but plugin loading could not be confirmed."
+        ok "Claude Code CLI responded successfully"
+        warn "Plugin agent verification could not be completed."
+        info "Installation succeeded but plugin loading could not be confirmed."
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Add to PATH in shell rc files (idempotent, supports bash + zsh)
+# 10. Add to PATH in shell rc files (idempotent, supports bash + zsh)
 # ---------------------------------------------------------------------------
+echo ""
+printf "${BOLD}${BLUE}  PATH Setup${RESET}\n"
 PATH_LINE="export PATH=\"$INSTALL_DIR/bin:\$PATH\""
 
-for rcfile in "$HOME/.bashrc" "$HOME/.zshrc"; do
+# On macOS, terminal shells are login shells that source profile files
+# (bash_profile/zprofile), not rc files (bashrc/zshrc). We add to both
+# to cover interactive login shells and non-login interactive shells.
+for rcfile in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.zprofile"; do
     [ -f "$rcfile" ] || continue
     if ! grep -qF "$INSTALL_DIR/bin" "$rcfile"; then
         printf '\n# xpatcher\n%s\n' "$PATH_LINE" >> "$rcfile"
-        echo "[ok] Added to PATH in $(basename "$rcfile")"
+        ok "Added to PATH in $(basename "$rcfile")"
     else
-        echo "[ok] PATH already configured in $(basename "$rcfile")"
+        ok "PATH already configured in $(basename "$rcfile")"
     fi
 done
 
 # Make it available in the current session too
 export PATH="$INSTALL_DIR/bin:$PATH"
 
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
 echo ""
-echo "Installation complete."
-echo ""
-echo "Run from any project directory:"
-echo "  cd /path/to/your/project"
-echo "  xpatcher start \"your task description\""
+printf "${BOLD}${GREEN}  ╔══════════════════════════════════════╗${RESET}\n"
+printf "${BOLD}${GREEN}  ║       Installation complete!         ║${RESET}\n"
+printf "${BOLD}${GREEN}  ╚══════════════════════════════════════╝${RESET}\n\n"
+info "Run from any project directory:"
+printf "  ${BOLD}cd /path/to/your/project${RESET}\n"
+printf "  ${BOLD}xpatcher start \"your task description\"${RESET}\n\n"
