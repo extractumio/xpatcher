@@ -57,6 +57,8 @@
 - [ ] Async dispatcher with streaming (currently synchronous `subprocess.run()`)
 - [ ] Full mid-pipeline resume (only supports paused human gates; execution-stage recovery requires manual intervention)
 - [ ] Cancel does not interrupt a running dispatcher (updates persisted state but the process continues until the next transition attempt)
+- [x] Gap re-entry state transition crash — fixed: gap re-entry now transitions to `blocked` when execution fails instead of leaving the pipeline in an intermediate state
+- [x] Planner empty `command` fields causing false `stuck` states — fixed: missing commands are tracked but no longer counted as acceptance failures
 
 #### Agents not wired
 - [ ] Simplifier agent: schema (`SimplificationOutput`) and agent definition exist, but not invoked in the quality loop
@@ -88,5 +90,5 @@
 - [ ] Pydantic schemas use camelCase in some places (JSON legacy) -- convert to snake_case for YAML consistency
 - [ ] Some skill definitions still reference `.xpatcher/current-plan.json` patterns
 - [ ] `install.sh` needs testing across macOS, Linux, WSL
-- [ ] Gap re-entry state transition crash (`InvalidTransitionError: task_breakdown -> blocked`)
-- [ ] Planner sometimes produces empty `command` fields for `must_pass` acceptance criteria, causing false `stuck` states
+- [x] ~~Gap re-entry state transition crash~~ (fixed: transitions to `blocked` with `gap_execution_failed` gate reason)
+- [x] ~~Planner empty `command` fields causing false `stuck` states~~ (fixed: missing commands no longer counted as failures)

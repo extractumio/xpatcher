@@ -788,6 +788,9 @@ class Dispatcher:
                 return False
 
             if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
+                sm.transition(PipelineStage.BLOCKED)
+                self._update_status(status="waiting_for_human", gate_reason="gap_execution_failed")
+                self.tui.warning("Gap re-entry tasks failed; pipeline blocked for human intervention.")
                 return False
 
     def _invoke_validated_agent(
@@ -828,14 +831,26 @@ class Dispatcher:
         resume_session_id: str | None = None,
     ) -> AgentResult:
         self._raise_if_cancelled()
-        model_key = "executor_default" if agent == "executor" else agent.replace("-", "_")
-        model = config.get("models", {}).get(model_key, config.get("models", {}).get(agent, "sonnet"))
-        timeout = config.get("timeouts", {}).get(agent.replace("-", "_"), config.get("timeouts", {}).get(agent, 600))
+        agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
+        agent_config = config.get("agents", {}).get(agent_key, {})
+
         if resume_session_id is None and self.registry is not None:
             resume_session_id = self.registry.get_session_for_continuation(stage, agent, task_id)
 
-        result = self.session.invoke(
-            AgentInvocation(
+        if agent_config.get("command"):
+            invocation = AgentInvocation(
+                prompt=prompt,
+                timeout=agent_config.get("timeout", 600),
+                session_id=resume_session_id,
+                cancel_check=self._is_cancelled,
+                command_template=agent_config["command"],
+                resume_args_template=agent_config.get("resume_args"),
+            )
+        else:
+            model_key = "executor_default" if agent == "executor" else agent.replace("-", "_")
+            model = config.get("models", {}).get(model_key, config.get("models", {}).get(agent, "sonnet"))
+            timeout = config.get("timeouts", {}).get(agent.replace("-", "_"), config.get("timeouts", {}).get(agent, 600))
+            invocation = AgentInvocation(
                 prompt=prompt,
                 agent=agent,
                 model=model,
@@ -843,7 +858,8 @@ class Dispatcher:
                 session_id=resume_session_id,
                 cancel_check=self._is_cancelled,
             )
-        )
+
+        result = self.session.invoke(invocation)
         self._raise_if_cancelled()
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
@@ -873,7 +889,6 @@ class Dispatcher:
                 continue
             command = criterion.get("command", "").strip()
             if not command:
-                failures.append(f"{criterion.get('id', 'unknown')}: missing command")
                 missing_commands += 1
                 continue
             proc = subprocess.run(

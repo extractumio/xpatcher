@@ -1,13 +1,165 @@
-models:
-  planner: "opus[1m]"
-  plan_reviewer: "opus"
-  executor_default: "sonnet"
-  reviewer: "opus"
-  tester: "sonnet"
-  simplifier: "sonnet"
-  gap_detector: "opus"
-  tech_writer: "sonnet"
-  explorer: "haiku"
+agents:
+  planner:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:planner"
+      - "--model"
+      - "opus[1m]"
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 600
+
+  plan_reviewer:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:plan-reviewer"
+      - "--model"
+      - opus
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 300
+
+  executor:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:executor"
+      - "--model"
+      - sonnet
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 900
+
+  reviewer:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:reviewer"
+      - "--model"
+      - opus
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 300
+
+  tester:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:tester"
+      - "--model"
+      - sonnet
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 600
+
+  simplifier:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:simplifier"
+      - "--model"
+      - sonnet
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 300
+
+  gap_detector:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:gap-detector"
+      - "--model"
+      - opus
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 300
+
+  tech_writer:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:tech-writer"
+      - "--model"
+      - sonnet
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 300
+
+  explorer:
+    command:
+      - claude
+      - "-p"
+      - "{prompt}"
+      - "--output-format"
+      - json
+      - "--plugin-dir"
+      - "{plugin_dir}"
+      - "--permission-mode"
+      - bypassPermissions
+      - "--agent"
+      - "xpatcher:explorer"
+      - "--model"
+      - haiku
+    resume_args: ["--resume", "{session_id}"]
+    timeout: 120
 
 iterations:
   plan_review_max: 3
@@ -21,13 +173,3 @@ session_management:
 human_gates:
   spec_confirmation: false
   completion_confirmation: false
-
-timeouts:
-  planner: 600
-  executor: 900
-  reviewer: 300
-  tester: 600
-  simplifier: 300
-  gap_detector: 300
-  tech_writer: 300
-  explorer: 120

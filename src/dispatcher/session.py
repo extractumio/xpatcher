@@ -29,6 +29,8 @@ class AgentInvocation:
     model: Optional[str] = None
     permission_mode: str = "bypassPermissions"
     cancel_check: Optional[Callable[[], bool]] = None
+    command_template: Optional[list[str]] = None
+    resume_args_template: Optional[list[str]] = None
 
 
 @dataclass
@@ -172,13 +174,33 @@ class ClaudeSession:
 
     def invoke(self, invocation: AgentInvocation) -> AgentResult:
         """Invoke a Claude agent via CLI."""
+        if invocation.command_template:
+            cmd = self._build_cmd_from_template(invocation)
+        else:
+            cmd = self._build_cmd_legacy(invocation)
+
+        return self._run_cmd(cmd, invocation)
+
+    def _build_cmd_from_template(self, invocation: AgentInvocation) -> list[str]:
+        """Build command from config-driven template with placeholder substitution."""
+        subs = {
+            "{prompt}": invocation.prompt,
+            "{plugin_dir}": str(self.plugin_dir),
+        }
+        cmd = [subs.get(arg, arg) for arg in invocation.command_template]
+        if invocation.session_id and invocation.resume_args_template:
+            resume_subs = {"{session_id}": invocation.session_id}
+            cmd.extend(resume_subs.get(arg, arg) for arg in invocation.resume_args_template)
+        return cmd
+
+    def _build_cmd_legacy(self, invocation: AgentInvocation) -> list[str]:
+        """Build command from individual AgentInvocation fields (backward compat)."""
         cmd = [
             "claude", "-p", invocation.prompt,
             "--output-format", "json",
             "--plugin-dir", str(self.plugin_dir),
             "--permission-mode", invocation.permission_mode,
         ]
-
         if invocation.agent:
             qualified = invocation.agent
             if ":" not in qualified:
@@ -194,6 +216,9 @@ class ClaudeSession:
             cmd.extend(["--allowed-tools", ",".join(invocation.allowed_tools)])
         if invocation.disallowed_tools:
             cmd.extend(["--disallowed-tools", ",".join(invocation.disallowed_tools)])
+        return cmd
+
+    def _run_cmd(self, cmd: list[str], invocation: AgentInvocation) -> AgentResult:
 
         if invocation.cancel_check is None:
             proc = subprocess.run(

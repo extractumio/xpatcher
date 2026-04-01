@@ -2,7 +2,7 @@
 
 See [README.md](README.md) for project description, installation, and usage.
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 
 ## Two Separate Contexts: Building xpatcher vs. Running xpatcher
 

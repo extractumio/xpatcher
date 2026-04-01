@@ -195,6 +195,59 @@ class TestClaudeSessionInvoke:
         assert cmd[idx + 1] == "WebSearch"
 
 
+class TestClaudeSessionCommandTemplate:
+    def setup_method(self):
+        self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_template_substitutes_prompt_and_plugin_dir(self, mock_run):
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+        inv = AgentInvocation(
+            prompt="do stuff",
+            command_template=["claude", "-p", "{prompt}", "--plugin-dir", "{plugin_dir}", "--model", "opus"],
+        )
+        self.session.invoke(inv)
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["claude", "-p", "do stuff", "--plugin-dir", "/tmp/plugin", "--model", "opus"]
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_template_appends_resume_args(self, mock_run):
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+        inv = AgentInvocation(
+            prompt="do stuff",
+            command_template=["claude", "-p", "{prompt}"],
+            resume_args_template=["--resume", "{session_id}"],
+            session_id="sess-abc",
+        )
+        self.session.invoke(inv)
+        cmd = mock_run.call_args[0][0]
+        assert cmd[-2:] == ["--resume", "sess-abc"]
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_template_skips_resume_args_when_no_session(self, mock_run):
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+        inv = AgentInvocation(
+            prompt="do stuff",
+            command_template=["claude", "-p", "{prompt}"],
+            resume_args_template=["--resume", "{session_id}"],
+        )
+        self.session.invoke(inv)
+        cmd = mock_run.call_args[0][0]
+        assert "--resume" not in cmd
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_template_with_custom_binary(self, mock_run):
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+        inv = AgentInvocation(
+            prompt="do stuff",
+            command_template=["codex", "--prompt", "{prompt}", "--model", "o3"],
+        )
+        self.session.invoke(inv)
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "codex"
+        assert cmd == ["codex", "--prompt", "do stuff", "--model", "o3"]
+
+
 # ===========================================================================
 # ClaudeSession.preflight
 # ===========================================================================

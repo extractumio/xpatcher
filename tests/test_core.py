@@ -342,6 +342,83 @@ class TestCliSkip:
         assert state["skipped_tasks"][0]["task_id"] == "task-001"
 
 
+class TestAcceptanceChecks:
+    def test_missing_commands_do_not_cause_failure(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        task["acceptance_criteria"][0]["command"] = ""
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "pass"
+        assert not report["regression_failures"]
+        assert report["verification_summary"]["missing_commands"] == 1
+        assert report["verification_summary"]["commands_executed"] == 0
+
+    def test_missing_commands_mixed_with_real_failures(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        task["acceptance_criteria"] = [
+            {"id": "ac-01", "description": "Has empty command", "verification": "command", "command": "", "severity": "must_pass"},
+            {"id": "ac-02", "description": "Fails on execution", "verification": "command", "command": "python -c \"import sys; sys.exit(1)\"", "severity": "must_pass"},
+        ]
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "fail"
+        assert len(report["regression_failures"]) == 1
+        assert "command failed" in report["regression_failures"][0]
+        assert report["verification_summary"]["missing_commands"] == 1
+
+
+class TestGapReentryBlocked:
+    def test_gap_reentry_transitions_to_blocked_when_execution_fails(self, tmp_path, monkeypatch):
+        dispatcher = _make_dispatcher(tmp_path)
+        store = ArtifactStore(dispatcher.feature_dir)
+        manifest = _manifest()
+        dispatcher._save_task_manifest(store, manifest, manifest_version=1)
+        dispatcher.state_file.write({
+            "current_stage": "task_execution",
+            "status": "running",
+            "task_states": {},
+            "iterations": {},
+            "transitions": [],
+            "total_cost_usd": 0.0,
+        })
+
+        gap_report_data = {"type": "gap_report", "verdict": "gaps_found", "gaps": [{"id": "G-1", "severity": "major", "category": "integration", "description": "Gap"}]}
+        task_manifest_data = {
+            "type": "task_manifest", "plan_version": 1, "summary": "Gap manifest",
+            "tasks": manifest["tasks"] + [{
+                "id": "task-G001", "title": "Gap task", "description": "Close the gap",
+                "files_in_scope": [], "acceptance_criteria": [
+                    {"id": "ac-gap", "description": "Gap check passes", "verification": "command", "command": "true", "severity": "must_pass"},
+                ],
+                "depends_on": [], "estimated_complexity": "low", "quality_tier": "lite",
+            }],
+        }
+        review_data = {"type": "task_manifest_review", "manifest_version": 2, "verdict": "approved", "confidence": "high", "summary": "OK"}
+
+        responses = iter([
+            (AgentResult(), type("V", (), {"valid": True, "data": gap_report_data})()),
+            (AgentResult(), type("V", (), {"valid": True, "data": task_manifest_data})()),
+            (AgentResult(), type("V", (), {"valid": True, "data": review_data})()),
+        ])
+        monkeypatch.setattr(dispatcher, "_invoke_validated_agent", lambda *args, **kwargs: next(responses))
+        monkeypatch.setattr(dispatcher, "_run_prioritization_and_execution", lambda *args, **kwargs: False)
+
+        sm = PipelineStateMachine(dispatcher.state_file)
+        result = dispatcher._run_gap_detection_with_reentry(
+            sm, store, PromptBuilder(dispatcher.feature_dir, dispatcher.project_dir),
+            {"iterations": {"gap_reentry_max": 2}}, plan_version=1,
+        )
+
+        state = dispatcher.state_file.read()
+        assert result is False
+        assert state["current_stage"] == "blocked"
+        assert state.get("gate_reason") == "gap_execution_failed"
+
+
 class TestPipelineIndex:
     def test_register_pipeline_index_creates_per_project_index_file(self, tmp_path):
         project_dir = tmp_path / "project-a"

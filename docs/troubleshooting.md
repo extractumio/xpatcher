@@ -7,14 +7,11 @@
 
 **Workaround:** After cancelling, Ctrl+C the running process manually.
 
-### Gap re-entry state transition crash
-When gap detection finds issues and triggers re-entry into task breakdown, the dispatcher can crash with `InvalidTransitionError: task_breakdown -> blocked`. The gap re-entry path does not handle all valid downstream transitions.
+### Gap re-entry state transition (fixed)
+Previously, when gap re-entry task execution failed, the pipeline was left in an intermediate state. Now the dispatcher transitions to `blocked` with gate reason `gap_execution_failed`, so the pipeline can be resumed after human intervention.
 
-### Planner produces malformed acceptance commands
-The planner/task-manifest sometimes omits or produces empty `command` fields for `must_pass` acceptance criteria. This causes the quality loop to mark tasks as `stuck` even when the produced code is correct, because the dispatcher cannot run the acceptance check.
-
-### Quality loop false negatives
-The orchestrator can report task-level `stuck` states even when committed code is locally correct, because acceptance-command quality dominates the control loop. If the planner doesn't produce runnable commands, the quality loop fails.
+### Planner produces malformed acceptance commands (mitigated)
+The planner/task-manifest sometimes omits or produces empty `command` fields for acceptance criteria. Missing commands are now tracked in the verification summary but no longer counted as failures. Tasks proceed to code review instead of being marked `stuck`. If real command-based checks pass, the task advances normally regardless of missing command specs.
 
 ## Debugging Workflow
 
@@ -60,5 +57,5 @@ Tasks marked `stuck` are moved back to `tasks/todo/`. To resolve:
 | Schema validation error on agent output | Agent produced output not matching Pydantic model | Check `schemas.py` for the expected format; may need prompt refinement |
 | Agent output is empty or malformed YAML | Context window exhaustion or model timeout | Increase timeout in `config.yaml`; check logs for truncation |
 | Pipeline stuck at human gate | Waiting for approval | Run `xpatcher pending` to see what needs attention |
-| Tests pass but task marked `stuck` | Empty acceptance command fields | Inspect task spec; planner didn't produce runnable commands |
+| Tests pass but task marked `stuck` | Reviewer keeps rejecting code | Inspect review findings; may need manual fix or `xpatcher skip` |
 
