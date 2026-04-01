@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# xpatcher CLI entry point.
+# Resolves the installation directory and runs the Python dispatcher
+# using the xpatcher venv.
+#
+# Usage: xpatcher start|resume|status|list|cancel|skip|pending [args...]
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
+export XPATCHER_HOME="$SCRIPT_DIR"
+exec "$SCRIPT_DIR/.venv/bin/python" -m src.dispatcher.core "$@"

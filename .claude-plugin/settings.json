@@ -1,0 +1,17 @@
+{
+  "defaultAgent": "xpatcher:explorer",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "command": ".claude-plugin/hooks/run_hook.sh pre_tool_use.py"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "command": ".claude-plugin/hooks/run_hook.sh post_tool_use.py"
+      }
+    ]
+  }
+}

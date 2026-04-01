@@ -1,0 +1,70 @@
+models:
+  planner: "opus[1m]"
+  plan_reviewer: "opus"
+  executor_default: "sonnet"
+  executor_critical: "opus"
+  reviewer: "opus"
+  tester: "sonnet"
+  simplifier: "sonnet"
+  gap_detector: "opus"
+  tech_writer: "sonnet"
+  explorer: "haiku"
+
+concurrency:
+  max_parallel_agents: 3
+  semaphore_timeout_sec: 30
+
+iterations:
+  plan_review_max: 3
+  task_review_max: 3
+  quality_loop_max: 3
+  gap_reentry_max: 2
+
+gap_detection:
+  max_gap_tasks_ratio: 0.3
+  categories:
+    critical: {auto_approve: true}
+    expected: {requires: "human_approval"}
+    enhancement: {default: "defer_to_backlog"}
+
+session_management:
+  compact_threshold_pct: 70
+  abandon_threshold_pct: 90
+  stale_session_timeout: 14400
+  context_bridging: true
+  max_lineage_depth: 5
+
+quality_tiers:
+  lite:
+    coverage: {enabled: true, min_line_coverage_for_new_code: 60}
+    negation_check: {enabled: false}
+    mutation: {enabled: false}
+    llm_audit: {enabled: false}
+    flaky_detection: {enabled: false}
+  standard:
+    coverage: {enabled: true, min_line_coverage_for_new_code: 80}
+    negation_check: {enabled: true, applies_to: "must_pass"}
+    mutation: {enabled: false}
+    llm_audit: {enabled: false}
+    flaky_detection: {enabled: true, repetitions: 3, must_pass_all: true}
+  thorough:
+    coverage: {enabled: true, min_line_coverage_for_new_code: 80}
+    negation_check: {enabled: true, applies_to: "must_pass"}
+    mutation: {enabled: true, min_mutation_score: 60}
+    llm_audit: {enabled: true}
+    flaky_detection: {enabled: true, repetitions: 5, must_pass_all: true}
+
+gates:
+  plan_approval: "human"
+  task_review_soft_timeout_sec: 1800
+  completion: "human"
+
+timeouts:
+  planner: 600
+  executor: 900
+  reviewer: 300
+  tester: 600
+  simplifier: 300
+  gap_detector: 300
+  tech_writer: 300
+  explorer: 120
