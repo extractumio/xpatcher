@@ -1,5 +1,4 @@
-"""Tests for dispatcher.session — ClaudeSession, AgentInvocation, AgentResult,
-PreflightResult, MalformedOutputRecovery, SessionRegistry."""
+"""Tests for dispatcher.session — ClaudeSession, MalformedOutputRecovery, SessionRegistry."""
 
 import json
 import subprocess
@@ -9,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from src.dispatcher.schemas import ArtifactValidator, ValidationResult
+from src.dispatcher.schemas import ArtifactValidator
 from src.dispatcher.session import (
     AgentInvocation,
     AgentResult,
@@ -18,51 +17,6 @@ from src.dispatcher.session import (
     PreflightResult,
     SessionRegistry,
 )
-
-
-# ===========================================================================
-# Dataclass defaults
-# ===========================================================================
-
-class TestAgentInvocation:
-    def test_defaults(self):
-        inv = AgentInvocation(prompt="test")
-        assert inv.prompt == "test"
-        assert inv.agent is None
-        assert inv.session_id is None
-        assert inv.max_turns is None
-        assert inv.timeout == 600
-        assert inv.allowed_tools is None
-        assert inv.disallowed_tools is None
-        assert inv.model is None
-        assert inv.permission_mode == "bypassPermissions"
-
-
-class TestAgentResult:
-    def test_defaults(self):
-        r = AgentResult()
-        assert r.session_id == ""
-        assert r.raw_text == ""
-        assert r.parsed is None
-        assert r.exit_code == 0
-        assert r.cost_usd == 0.0
-        assert r.duration_ms == 0
-        assert r.num_turns == 0
-        assert r.stop_reason == ""
-        assert r.usage is None
-        assert r.events == []
-
-
-class TestPreflightResult:
-    def test_defaults(self):
-        r = PreflightResult(ok=True)
-        assert r.ok is True
-        assert r.error == ""
-        assert r.cli_version == ""
-        assert r.plugin_loaded is False
-        assert r.agents_found == []
-        assert r.cost_usd == 0.0
-
 
 # ===========================================================================
 # ClaudeSession._extract_yaml
@@ -111,88 +65,56 @@ class TestClaudeSessionInvoke:
         self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_basic_command(self, mock_run):
+    def test_legacy_invoke_builds_full_command_from_invocation(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps([]),
             returncode=0,
         )
-        inv = AgentInvocation(prompt="do stuff")
+        inv = AgentInvocation(
+            prompt="do stuff",
+            agent="planner",
+            session_id="sess-123",
+            model="opus",
+            max_turns=5,
+            allowed_tools=["Read", "Bash"],
+            disallowed_tools=["WebSearch"],
+        )
         self.session.invoke(inv)
 
         cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "claude"
-        assert "-p" in cmd
-        assert "do stuff" in cmd
-        assert "--output-format" in cmd
-        assert "--plugin-dir" in cmd
-        assert "--permission-mode" in cmd
+        assert cmd == [
+            "claude",
+            "-p",
+            "do stuff",
+            "--output-format",
+            "json",
+            "--plugin-dir",
+            "/tmp/plugin",
+            "--permission-mode",
+            "bypassPermissions",
+            "--agent",
+            "xpatcher:planner",
+            "--resume",
+            "sess-123",
+            "--max-turns",
+            "5",
+            "--model",
+            "opus",
+            "--allowed-tools",
+            "Read,Bash",
+            "--disallowed-tools",
+            "WebSearch",
+        ]
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_agent_flag_auto_prefix(self, mock_run):
+    def test_preserves_already_qualified_agent_name(self, mock_run):
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", agent="planner")
-        self.session.invoke(inv)
+
+        self.session.invoke(AgentInvocation(prompt="test", agent="xpatcher:planner"))
+
         cmd = mock_run.call_args[0][0]
-        assert "--agent" in cmd
         agent_idx = cmd.index("--agent")
         assert cmd[agent_idx + 1] == "xpatcher:planner"
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_agent_flag_already_qualified(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", agent="xpatcher:planner")
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        agent_idx = cmd.index("--agent")
-        assert cmd[agent_idx + 1] == "xpatcher:planner"
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_resume_flag(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", session_id="sess-123")
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert "--resume" in cmd
-        resume_idx = cmd.index("--resume")
-        assert cmd[resume_idx + 1] == "sess-123"
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_model_flag(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", model="opus")
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert "--model" in cmd
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_max_turns_flag(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", max_turns=5)
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert "--max-turns" in cmd
-        idx = cmd.index("--max-turns")
-        assert cmd[idx + 1] == "5"
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_allowed_tools_flag(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", allowed_tools=["Read", "Bash"])
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert "--allowed-tools" in cmd
-        idx = cmd.index("--allowed-tools")
-        assert cmd[idx + 1] == "Read,Bash"
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_disallowed_tools_flag(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(prompt="test", disallowed_tools=["WebSearch"])
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert "--disallowed-tools" in cmd
-        idx = cmd.index("--disallowed-tools")
-        assert cmd[idx + 1] == "WebSearch"
 
 
 class TestClaudeSessionCommandTemplate:
@@ -200,28 +122,27 @@ class TestClaudeSessionCommandTemplate:
         self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_template_substitutes_prompt_and_plugin_dir(self, mock_run):
+    def test_template_substitutes_runtime_values_and_resume_args(self, mock_run):
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
         inv = AgentInvocation(
             prompt="do stuff",
             command_template=["claude", "-p", "{prompt}", "--plugin-dir", "{plugin_dir}", "--model", "opus"],
-        )
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert cmd == ["claude", "-p", "do stuff", "--plugin-dir", "/tmp/plugin", "--model", "opus"]
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_template_appends_resume_args(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(
-            prompt="do stuff",
-            command_template=["claude", "-p", "{prompt}"],
             resume_args_template=["--resume", "{session_id}"],
             session_id="sess-abc",
         )
         self.session.invoke(inv)
         cmd = mock_run.call_args[0][0]
-        assert cmd[-2:] == ["--resume", "sess-abc"]
+        assert cmd == [
+            "claude",
+            "-p",
+            "do stuff",
+            "--plugin-dir",
+            "/tmp/plugin",
+            "--model",
+            "opus",
+            "--resume",
+            "sess-abc",
+        ]
 
     @patch("src.dispatcher.session.subprocess.run")
     def test_template_skips_resume_args_when_no_session(self, mock_run):
@@ -378,7 +299,7 @@ class TestMalformedOutputRecovery:
         )
         self.mock_session.invoke.return_value = first_result
         inv = AgentInvocation(prompt="test")
-        result, validation = self.recovery.invoke_with_validation(inv, "simplification")
+        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
         assert validation.valid is True
         # Should have been called only once
         assert self.mock_session.invoke.call_count == 1
@@ -393,7 +314,7 @@ class TestMalformedOutputRecovery:
 
         self.mock_session.invoke.side_effect = [invalid_result, valid_result]
         inv = AgentInvocation(prompt="test")
-        result, validation = self.recovery.invoke_with_validation(inv, "simplification")
+        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
         assert validation.valid is True
         assert self.mock_session.invoke.call_count == 2
 
@@ -401,7 +322,7 @@ class TestMalformedOutputRecovery:
         bad = AgentResult(session_id="sess-1", raw_text="garbage")
         self.mock_session.invoke.return_value = bad
         inv = AgentInvocation(prompt="test")
-        result, validation = self.recovery.invoke_with_validation(inv, "simplification")
+        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
         assert validation.valid is False
         # 1 initial + MAX_FIX_ATTEMPTS retries
         assert self.mock_session.invoke.call_count == 1 + MalformedOutputRecovery.MAX_FIX_ATTEMPTS

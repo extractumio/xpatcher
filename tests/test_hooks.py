@@ -79,6 +79,11 @@ class TestPreToolUseHook:
         assert output["decision"] == "allow"
         assert code == 0
 
+    def test_planner_allows_env_prefixed_safe_command(self):
+        output, code = run_hook("Bash", {"command": "FOO=1 git log --oneline"}, agent_name="planner")
+        assert output["decision"] == "allow"
+        assert code == 0
+
     def test_tester_allowed_write_test_file(self):
         output, code = run_hook("Write", {"file_path": "/project/tests/test_foo.py"}, agent_name="tester")
         assert output["decision"] == "allow"
@@ -111,6 +116,16 @@ class TestPreToolUseHook:
 
     def test_executor_blocked_from_web_tools(self):
         output, code = run_hook("WebSearch", {"query": "test"}, agent_name="executor")
+        assert output["decision"] == "block"
+        assert code == 2
+
+    def test_read_only_agent_blocks_command_chaining_via_subshell(self):
+        output, code = run_hook("Bash", {"command": "git log $(python -c 'print(1)')"}, agent_name="planner")
+        assert output["decision"] == "block"
+        assert code == 2
+
+    def test_read_only_agent_blocks_unsafe_pipe_target(self):
+        output, code = run_hook("Bash", {"command": "git log | python3 -c 'print(1)'"}, agent_name="planner")
         assert output["decision"] == "block"
         assert code == 2
 

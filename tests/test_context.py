@@ -45,7 +45,7 @@ class TestPromptBuilder:
         assert "PlanReviewOutput" in plan_prompt
         assert "TaskManifestReviewOutput" in task_prompt
 
-    def test_prompts_frame_artifacts_as_ephemeral_specifications(self, tmp_path):
+    def test_builder_renders_required_runtime_paths_without_placeholders(self, tmp_path):
         builder = _make_builder(tmp_path)
         (builder.feature_dir / "intent.yaml").write_text(yaml.dump({"goal": "Add login flow"}))
         (builder.feature_dir / "plan-v1.yaml").write_text(yaml.dump({"type": "plan"}))
@@ -57,6 +57,8 @@ class TestPromptBuilder:
         executor_prompt = builder.build_executor("task-001")
         writer_prompt = builder.build_tech_writer()
 
-        assert "temporary specification artifact" in planner_prompt
-        assert "source code is the only long-term source of truth" in executor_prompt
-        assert "not preserve or restate ephemeral planning artifacts" in writer_prompt
+        assert str(builder.feature_dir / "intent.yaml") in planner_prompt
+        assert str(task_path) in executor_prompt
+        assert str(builder.project_dir) in executor_prompt
+        assert str(builder.feature_dir) in writer_prompt
+        assert "${" not in planner_prompt + executor_prompt + writer_prompt

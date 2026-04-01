@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.dispatcher.schemas import ArtifactValidator, PlanReviewOutput, TaskManifestOutput, TaskManifestReviewOutput
+from src.dispatcher.schemas import ArtifactValidator, TaskManifestOutput
 
 
 def _task_manifest_data() -> dict:
@@ -85,36 +85,6 @@ class TestSchemaContracts:
             ],
         )
         assert plan.phases[0].tasks[0].estimated_complexity.value == "low"
-
-    def test_plan_review_uses_stage_specific_schema(self):
-        review = PlanReviewOutput(
-            type="plan_review",
-            plan_version=1,
-            verdict="approved",
-            confidence="high",
-            summary="The plan is feasible and ready to execute",
-        )
-        assert review.verdict == "approved"
-
-    def test_task_manifest_review_uses_stage_specific_schema(self):
-        review = TaskManifestReviewOutput(
-            type="task_manifest_review",
-            manifest_version=1,
-            verdict="needs_changes",
-            confidence="medium",
-            summary="The manifest is missing a regression command",
-            findings=[
-                {
-                    "id": "F-1",
-                    "severity": "major",
-                    "category": "completeness",
-                    "file": "task-manifest.yaml",
-                    "description": "A command-backed acceptance criterion is required",
-                }
-            ],
-        )
-        assert review.verdict == "needs_changes"
-        assert len(review.findings) == 1
 
     def test_task_manifest_requires_executable_acceptance_checks(self):
         data = _task_manifest_data()

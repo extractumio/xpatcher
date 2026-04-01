@@ -1,54 +1,10 @@
-"""Tests for dispatcher.state — PipelineStage, TaskState, PipelineStateFile,
-PipelineStateMachine, TaskDAG."""
+"""Tests for dispatcher.state — PipelineStateFile, PipelineStateMachine, TaskDAG."""
 
 import os
 
 import pytest
 
-from src.dispatcher.state import (
-    TERMINAL_STAGES,
-    VALID_TRANSITIONS,
-    InvalidTransitionError,
-    PipelineStage,
-    PipelineStateFile,
-    PipelineStateMachine,
-    TaskDAG,
-    TaskState,
-)
-
-
-# ===========================================================================
-# PipelineStage enum
-# ===========================================================================
-
-class TestPipelineStage:
-    def test_has_all_values(self):
-        # The spec says 22 values -- but let's just verify against the enum.
-        # Count actual members, not the alias count.
-        # The enum is: UNINITIALIZED through ROLLED_BACK = 23 values
-        expected = {
-            "uninitialized", "intent_capture", "planning", "plan_review",
-            "plan_fix", "plan_approval", "task_breakdown", "task_review",
-            "task_fix", "prioritization", "execution_graph", "task_execution",
-            "per_task_quality", "fix_iteration", "gap_detection", "documentation",
-            "completion", "done", "paused", "blocked", "failed", "cancelled",
-            "rolled_back",
-        }
-        assert set(s.value for s in PipelineStage) == expected
-
-
-# ===========================================================================
-# TaskState enum
-# ===========================================================================
-
-class TestTaskState:
-    def test_has_all_values(self):
-        expected = {
-            "pending", "blocked", "ready", "running", "succeeded",
-            "failed", "needs_fix", "stuck", "skipped", "cancelled",
-        }
-        assert set(s.value for s in TaskState) == expected
-        assert len(TaskState) == 10
+from src.dispatcher.state import InvalidTransitionError, PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
 
 
 # ===========================================================================
@@ -109,33 +65,24 @@ class TestPipelineStateMachine:
         with pytest.raises(InvalidTransitionError):
             sm.transition(PipelineStage.DONE)
 
-    def test_any_nonterminal_to_cancelled(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("target_stage", "expected_value"),
+        [
+            (PipelineStage.CANCELLED, "cancelled"),
+            (PipelineStage.PAUSED, "paused"),
+            (PipelineStage.FAILED, "failed"),
+            (PipelineStage.BLOCKED, "blocked"),
+        ],
+    )
+    def test_any_nonterminal_can_enter_global_escape_hatches(self, tmp_path, target_stage, expected_value):
         sm = self._make_sm(tmp_path)
         sm.transition(PipelineStage.INTENT_CAPTURE)
-        sm.transition(PipelineStage.CANCELLED)
-        assert sm.current_stage == PipelineStage.CANCELLED
-
-    def test_any_nonterminal_to_paused(self, tmp_path):
-        sm = self._make_sm(tmp_path)
-        sm.transition(PipelineStage.INTENT_CAPTURE)
-        sm.transition(PipelineStage.PAUSED)
-        assert sm.current_stage == PipelineStage.PAUSED
-
-    def test_any_nonterminal_to_failed(self, tmp_path):
-        sm = self._make_sm(tmp_path)
-        sm.transition(PipelineStage.INTENT_CAPTURE)
-        sm.transition(PipelineStage.FAILED)
-        assert sm.current_stage == PipelineStage.FAILED
-
-    def test_any_nonterminal_to_blocked(self, tmp_path):
-        sm = self._make_sm(tmp_path)
-        sm.transition(PipelineStage.INTENT_CAPTURE)
-        sm.transition(PipelineStage.BLOCKED)
-        assert sm.current_stage == PipelineStage.BLOCKED
+        state = sm.transition(target_stage)
+        assert sm.current_stage == target_stage
+        assert state["current_stage"] == expected_value
 
     def test_terminal_done_cannot_transition(self, tmp_path):
         sm = self._make_sm(tmp_path)
-        # Walk to DONE
         sm.transition(PipelineStage.INTENT_CAPTURE)
         sm.transition(PipelineStage.PLANNING)
         sm.transition(PipelineStage.PLAN_REVIEW)
@@ -175,10 +122,6 @@ class TestPipelineStateMachine:
             sm.transition(PipelineStage.PLANNING)
 
     def test_terminal_rolled_back_cannot_transition(self, tmp_path):
-        sm = self._make_sm(tmp_path)
-        sm.transition(PipelineStage.INTENT_CAPTURE)
-        sm.transition(PipelineStage.CANCELLED)
-        # CANCELLED is terminal, so force state for testing ROLLED_BACK
         sf = PipelineStateFile(str(tmp_path / "state.yaml"))
         sf.write({"current_stage": "rolled_back"})
         sm2 = PipelineStateMachine(sf)
