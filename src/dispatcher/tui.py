@@ -18,6 +18,16 @@ class TUIRenderer:
 
     def __init__(self):
         self._start_time = datetime.now(timezone.utc)
+        self._current_stage = ""
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _prefix(self) -> str:
+        ts = self._ts()
+        if self._current_stage:
+            return f"{self.DIM}{ts} [{self._current_stage}]{self.RESET} "
+        return f"{self.DIM}{ts}{self.RESET} "
 
     def header(self, text: str):
         print(f"\n{self.BOLD}{self.CYAN}{'='*60}{self.RESET}")
@@ -25,39 +35,40 @@ class TUIRenderer:
         print(f"{self.BOLD}{self.CYAN}{'='*60}{self.RESET}\n")
 
     def stage(self, text: str):
+        self._current_stage = text.split(":")[0].strip() if ":" in text else text.strip()
         elapsed = self._elapsed()
-        print(f"{self.BOLD}{self.BLUE}▸ {text}{self.RESET} {self.DIM}[{elapsed}]{self.RESET}")
+        print(f"{self._prefix()}{self.BOLD}{self.BLUE}▸ {text}{self.RESET} {self.DIM}[{elapsed}]{self.RESET}")
 
     def status(self, text: str):
-        print(f"  {self.DIM}{text}{self.RESET}")
+        print(f"{self._prefix()}{self.DIM}{text}{self.RESET}")
 
     def success(self, text: str):
-        print(f"  {self.GREEN}✓ {text}{self.RESET}")
+        print(f"{self._prefix()}{self.GREEN}✓ {text}{self.RESET}")
 
     def error(self, text: str):
-        print(f"  {self.RED}✗ {text}{self.RESET}", file=sys.stderr)
+        print(f"{self._prefix()}{self.RED}✗ {text}{self.RESET}", file=sys.stderr)
 
     def warning(self, text: str):
-        print(f"  {self.YELLOW}⚠ {text}{self.RESET}")
+        print(f"{self._prefix()}{self.YELLOW}⚠ {text}{self.RESET}")
 
     def info(self, text: str):
-        print(f"  {text}")
+        print(f"{self._prefix()}{text}")
 
     def debug(self, text: str):
-        print(f"  {self.DIM}{self.CYAN}[debug]{self.RESET} {self.DIM}{text}{self.RESET}", file=sys.stderr)
+        print(f"{self._prefix()}{self.DIM}{self.CYAN}[debug]{self.RESET} {self.DIM}{text}{self.RESET}", file=sys.stderr)
 
     def human_gate(self, text: str):
         print(f"\n{self.BOLD}{self.YELLOW}{'─'*60}{self.RESET}")
-        print(f"{self.BOLD}{self.YELLOW}  🔒 {text}{self.RESET}")
+        print(f"{self._prefix()}{self.BOLD}{self.YELLOW}🔒 {text}{self.RESET}")
         print(f"{self.BOLD}{self.YELLOW}{'─'*60}{self.RESET}")
         # Terminal bell
         print("\a", end="", flush=True)
 
     def cost_update(self, total_cost: float):
-        print(f"  {self.DIM}Running cost: ${total_cost:.4f}{self.RESET}")
+        print(f"{self._prefix()}{self.DIM}Running cost: ${total_cost:.4f}{self.RESET}")
 
     def cost_summary(self, total_cost: float):
-        print(f"\n  {self.BOLD}Total pipeline cost: ${total_cost:.4f}{self.RESET}")
+        print(f"\n{self._prefix()}{self.BOLD}Total pipeline cost: ${total_cost:.4f}{self.RESET}")
 
     def prompt_approval(self, prompt: str) -> bool:
         try:

@@ -126,7 +126,8 @@ class SessionTailer:
 
     @staticmethod
     def _emit(text: str) -> None:
-        print(f"  {_DIM}{_CYAN}│{_RESET} {_DIM}{text}{_RESET}", file=sys.stderr, flush=True)
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"  {_DIM}{ts} {_CYAN}│{_RESET} {_DIM}{text}{_RESET}", file=sys.stderr, flush=True)
 
 
 # ── Agent JSON baking ────────────────────────────────────────────────────────
