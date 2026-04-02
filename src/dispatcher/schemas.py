@@ -611,9 +611,23 @@ class ArtifactValidator:
                     task["quality_tier"] = "lite"
 
         if artifact_type == "plan":
-            # Normalize goal → summary
-            if "summary" not in data and "goal" in data:
-                data["summary"] = data.pop("goal")
+            # Normalize goal/title/description → summary
+            if "summary" not in data:
+                if "goal" in data:
+                    data["summary"] = data.pop("goal")
+                elif "title" in data and "description" in data:
+                    data["summary"] = data.pop("description")
+                elif "title" in data:
+                    data["summary"] = data.pop("title")
+                elif "description" in data:
+                    data["summary"] = data.pop("description")
+            # Normalize open_questions: dicts → strings
+            oq = data.get("open_questions", [])
+            if oq and isinstance(oq[0], dict):
+                data["open_questions"] = [
+                    item.get("question", str(item)) if isinstance(item, dict) else str(item)
+                    for item in oq
+                ]
             # Normalize flat tasks list → single phase wrapper
             if "phases" not in data and "tasks" in data:
                 data["phases"] = [{

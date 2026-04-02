@@ -452,39 +452,55 @@ class ClaudeSession:
             stderr = proc.stderr or ""
             cancelled = False
         else:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=str(self.project_dir),
-                env=self._subprocess_env,
-                start_new_session=True,
-            )
-            start = time.monotonic()
-            stdout = ""
-            stderr = ""
-            cancelled = False
-
+            # Use temp files instead of PIPE to avoid pipe buffer exhaustion.
+            # Large sessions (>64KB of --output-format json events) would fill
+            # the pipe, causing the CLI to block or silently discard output.
+            import tempfile
+            stdout_file = tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False)
+            stderr_file = tempfile.NamedTemporaryFile(mode="w+", suffix=".err", delete=False)
             try:
-                while True:
-                    if invocation.cancel_check():
-                        cancelled = True
-                        self._terminate_process(proc)
-                        stdout, stderr = proc.communicate()
-                        break
-                    if proc.poll() is not None:
-                        stdout, stderr = proc.communicate()
-                        break
-                    if time.monotonic() - start > invocation.timeout:
-                        self._terminate_process(proc)
-                        raise subprocess.TimeoutExpired(cmd, invocation.timeout)
-                    if invocation.debug_tailer:
-                        invocation.debug_tailer.poll()
-                    time.sleep(0.25)
-            except KeyboardInterrupt:
-                self._terminate_process(proc)
-                raise
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    cwd=str(self.project_dir),
+                    env=self._subprocess_env,
+                    start_new_session=True,
+                )
+                start = time.monotonic()
+                stdout = ""
+                stderr = ""
+                cancelled = False
+
+                try:
+                    while True:
+                        if invocation.cancel_check():
+                            cancelled = True
+                            self._terminate_process(proc)
+                            proc.wait()
+                            break
+                        if proc.poll() is not None:
+                            break
+                        if time.monotonic() - start > invocation.timeout:
+                            self._terminate_process(proc)
+                            raise subprocess.TimeoutExpired(cmd, invocation.timeout)
+                        if invocation.debug_tailer:
+                            invocation.debug_tailer.poll()
+                        time.sleep(0.25)
+                except KeyboardInterrupt:
+                    self._terminate_process(proc)
+                    raise
+
+                stdout_file.close()
+                stderr_file.close()
+                stdout = Path(stdout_file.name).read_text()
+                stderr = Path(stderr_file.name).read_text()
+            finally:
+                for f in (stdout_file, stderr_file):
+                    try:
+                        Path(f.name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         try:
             events = json.loads(stdout) if stdout else []
