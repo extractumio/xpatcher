@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .auth import resolve_auth_env, describe_auth_source
 from .state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
-from .session import AgentInvocation, AgentResult, ClaudeSession, SessionRegistry, SessionTailer
+from .session import AgentInvocation, AgentResult, ClaudeSession, SessionTailer
 from .schemas import ArtifactValidator, ValidationResult
 from .tui import TUIRenderer
 from .yaml_utils import load_yaml_file
@@ -130,7 +130,8 @@ class Dispatcher:
         self.tui = TUIRenderer()
         self.total_cost_usd = 0.0
         self.state_file: PipelineStateFile | None = None
-        self.registry: SessionRegistry | None = None
+        self.pipeline_session_id: str = ""
+        self._pipeline_session_used: bool = False
         self.feature_dir: Path | None = None
 
     def _require_auth(self):
@@ -204,13 +205,13 @@ class Dispatcher:
         store = ArtifactStore(feature_dir)
         prompt_builder = PromptBuilder(feature_dir, self.project_dir)
         config = self._load_config()
-        abandon_pct = config.get("session_management", {}).get("abandon_threshold_pct", 90)
-        registry = SessionRegistry(feature_dir / "sessions.yaml", abandon_threshold_pct=abandon_pct)
 
         self.state_file = state_file
-        self.registry = registry
         self.feature_dir = feature_dir
         self.total_cost_usd = 0.0
+        # Single session for the entire pipeline — resume after first use
+        self.pipeline_session_id = str(uuid.uuid4())
+        self._pipeline_session_used = False
 
         subprocess.run(
             ["git", "checkout", "-b", branch_name],
@@ -238,9 +239,9 @@ class Dispatcher:
         self.feature_dir = feature_dir
         self.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
         config = self._load_config()
-        abandon_pct = config.get("session_management", {}).get("abandon_threshold_pct", 90)
-        self.registry = SessionRegistry(feature_dir / "sessions.yaml", abandon_threshold_pct=abandon_pct)
         self.total_cost_usd = self.state_file.read().get("total_cost_usd", 0.0)
+        self.pipeline_session_id = str(uuid.uuid4())
+        self._pipeline_session_used = False
 
         state = self.state_file.read()
         current = PipelineStage(state.get("current_stage", PipelineStage.UNINITIALIZED.value))
@@ -911,12 +912,13 @@ class Dispatcher:
         agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
         agent_config = config.get("agents", {}).get(agent_key, {})
 
-        if resume_session_id is None and self.registry is not None:
-            resume_session_id = self.registry.get_session_for_continuation(stage, agent, task_id)
-
-        # Pre-assign session ID so it's known before the process starts
-        is_resume = resume_session_id is not None
-        session_id = resume_session_id or str(uuid.uuid4())
+        # Pipeline-wide session: first call is fresh, all subsequent resume
+        if not self.pipeline_session_id:
+            self.pipeline_session_id = str(uuid.uuid4())
+        session_id = self.pipeline_session_id
+        is_resume = self._pipeline_session_used
+        if not self._pipeline_session_used:
+            self._pipeline_session_used = True
 
         if agent_config.get("command"):
             invocation = AgentInvocation(
@@ -972,8 +974,6 @@ class Dispatcher:
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
         self._update_status(total_cost_usd=self.total_cost_usd)
-        if self.registry is not None and result.session_id:
-            self.registry.register(result, agent, stage, task_id)
         log_path = self._write_agent_log(agent, result, task_id)
 
         if self.debug:

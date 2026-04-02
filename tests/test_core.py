@@ -144,7 +144,7 @@ class TestDispatcherCancellation:
 
 
 class TestDispatcherPersistence:
-    def test_invoke_agent_persists_cost_logs_and_session(self, tmp_path):
+    def test_invoke_agent_persists_cost_and_logs(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
         dispatcher.session.invoke = lambda invocation: AgentResult(
             session_id="sess-1",
@@ -163,11 +163,9 @@ class TestDispatcherPersistence:
         )
 
         state = dispatcher.state_file.read()
-        session_data = yaml.safe_load((dispatcher.feature_dir / "sessions.yaml").read_text())
         log_files = list((dispatcher.feature_dir / "logs").glob("agent-tech-writer-*.jsonl"))
 
         assert state["total_cost_usd"] == 1.25
-        assert "sess-1" in session_data["sessions"]
         assert log_files
 
 

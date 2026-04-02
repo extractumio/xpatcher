@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from src.dispatcher.core import Dispatcher
-from src.dispatcher.session import AgentInvocation, AgentResult, ClaudeSession, SessionRegistry
+from src.dispatcher.session import AgentInvocation, AgentResult, ClaudeSession
 from src.dispatcher.state import PipelineStateFile
 
 
@@ -42,7 +42,6 @@ def _make_dispatcher(tmp_path) -> Dispatcher:
     dispatcher.feature_dir = feature_dir
     dispatcher.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
     dispatcher.state_file.write({"task_states": {}, "total_cost_usd": 0.0, "iterations": {}, "transitions": []})
-    dispatcher.registry = SessionRegistry(feature_dir / "sessions.yaml")
     return dispatcher
 
 
@@ -85,12 +84,12 @@ class TestDispatcherInvokeUsesConfig:
 
         def fake_invoke(invocation: AgentInvocation) -> AgentResult:
             cmd = dispatcher.session._build_cmd_from_template(invocation)
-            captured.append(cmd)
+            captured.append((cmd, invocation.resume))
             return AgentResult(session_id="sess-ok", exit_code=0, events=[{"type": "result"}])
 
         dispatcher.session.invoke = fake_invoke
 
-        for code_name, agent_cfg in (
+        for i, (code_name, agent_cfg) in enumerate((
             ("planner", CONFIG["agents"]["planner"]),
             ("plan-reviewer", CONFIG["agents"]["plan_reviewer"]),
             ("executor", CONFIG["agents"]["executor"]),
@@ -100,18 +99,22 @@ class TestDispatcherInvokeUsesConfig:
             ("gap-detector", CONFIG["agents"]["gap_detector"]),
             ("tech-writer", CONFIG["agents"]["tech_writer"]),
             ("explorer", CONFIG["agents"]["explorer"]),
-        ):
+        )):
             result = dispatcher._invoke_agent(
                 agent=code_name,
                 prompt=f"run {code_name}",
                 config=CONFIG,
                 stage="testing",
-                resume_session_id="sess-prev",
             )
 
-            cmd = captured.pop(0)
+            cmd, was_resume = captured.pop(0)
             assert result.exit_code == 0
             assert _flag_value(cmd, "-p") == f"run {code_name}"
             assert _flag_value(cmd, "--agent") == _flag_value(agent_cfg["command"], "--agent")
             assert _flag_value(cmd, "--model") == _flag_value(agent_cfg["command"], "--model")
-            assert _flag_value(cmd, "--resume") == "sess-prev"
+            # First call is fresh (session-id), rest resume the pipeline session
+            if i == 0:
+                assert not was_resume
+            else:
+                assert was_resume
+                assert _flag_value(cmd, "--resume") == dispatcher.pipeline_session_id
