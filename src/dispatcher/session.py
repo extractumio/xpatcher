@@ -625,9 +625,14 @@ class SessionRegistry:
     def get_session_for_continuation(
         self, stage: str, agent_type: str, task_id: str = ""
     ) -> Optional[str]:
-        """Find a reusable session. Returns None if context likely exhausted."""
+        """Find a reusable session. Returns None if context likely exhausted.
+
+        Sessions are matched by (agent_type, stage, task_id) — all three must
+        match. This prevents cross-stage reuse (e.g. intent_capture session
+        being resumed for planning even though both use the planner agent).
+        """
         for sid, rec in self._sessions.items():
-            if rec.agent_type == agent_type and rec.task_id == task_id:
+            if rec.agent_type == agent_type and rec.stage == stage and rec.task_id == task_id:
                 context_limit = 1_000_000 if "[1m]" in agent_type else 200_000
                 if rec.token_estimate > context_limit * self._abandon_threshold:
                     continue
