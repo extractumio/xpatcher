@@ -118,6 +118,61 @@ class TestClaudeSessionInvoke:
         assert cmd[agent_idx + 1] == "xpatcher:planner"
 
 
+class TestClaudeSessionClaudeMd:
+    """CLAUDE.md injection via --append-system-prompt-file."""
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_appends_claude_md_when_file_exists(self, mock_run, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        claude_md = project_dir / "CLAUDE.md"
+        claude_md.write_text("# Project Guide\nUse pytest for tests.\n")
+
+        session = ClaudeSession(Path("/tmp/plugin"), project_dir)
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+
+        session.invoke(AgentInvocation(prompt="test", agent="planner"))
+
+        cmd = mock_run.call_args[0][0]
+        assert "--append-system-prompt-file" in cmd
+        idx = cmd.index("--append-system-prompt-file")
+        assert cmd[idx + 1] == str(claude_md)
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_skips_claude_md_when_file_missing(self, mock_run, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        # No CLAUDE.md created
+
+        session = ClaudeSession(Path("/tmp/plugin"), project_dir)
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+
+        session.invoke(AgentInvocation(prompt="test", agent="planner"))
+
+        cmd = mock_run.call_args[0][0]
+        assert "--append-system-prompt-file" not in cmd
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_claude_md_works_with_command_template(self, mock_run, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "CLAUDE.md").write_text("# Guide\n")
+
+        session = ClaudeSession(Path("/tmp/plugin"), project_dir)
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+
+        inv = AgentInvocation(
+            prompt="test",
+            command_template=["claude", "--bare", "-p", "{prompt}"],
+        )
+        session.invoke(inv)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--append-system-prompt-file" in cmd
+        idx = cmd.index("--append-system-prompt-file")
+        assert cmd[idx + 1] == str(project_dir / "CLAUDE.md")
+
+
 class TestClaudeSessionCommandTemplate:
     def setup_method(self):
         self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
