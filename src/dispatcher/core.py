@@ -276,7 +276,7 @@ class Dispatcher:
                 docs_out = self.feature_dir / "docs-report.yaml"
                 _, validation = self._invoke_validated_agent(
                     agent="tech-writer",
-                    prompt=prompt_builder.build_tech_writer(docs_out),
+                    prompt=prompt_builder.build_tech_writer(docs_out, self._agent_timeout(config, "tech-writer")),
                     config=config,
                     expected_type="docs_report",
                     stage=PipelineStage.DOCUMENTATION.value,
@@ -324,7 +324,7 @@ class Dispatcher:
         intent_path = self.feature_dir / "intent.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_intent_capture(description, intent_path),
+            prompt=prompt_builder.build_intent_capture(description, intent_path, self._agent_timeout(config, "planner")),
             config=config,
             expected_type="intent",
             stage=PipelineStage.INTENT_CAPTURE.value,
@@ -340,7 +340,7 @@ class Dispatcher:
         plan_v1_path = self.feature_dir / "plan-v1.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_planner(plan_v1_path),
+            prompt=prompt_builder.build_planner(plan_v1_path, self._agent_timeout(config, "planner")),
             config=config,
             expected_type="plan",
             stage=PipelineStage.PLANNING.value,
@@ -380,7 +380,7 @@ class Dispatcher:
         docs_out = self.feature_dir / "docs-report.yaml"
         _, validation = self._invoke_validated_agent(
             agent="tech-writer",
-            prompt=prompt_builder.build_tech_writer(docs_out),
+            prompt=prompt_builder.build_tech_writer(docs_out, self._agent_timeout(config, "tech-writer")),
             config=config,
             expected_type="docs_report",
             stage=PipelineStage.DOCUMENTATION.value,
@@ -412,7 +412,7 @@ class Dispatcher:
             review_out = self.feature_dir / f"plan-review-v{plan_version}.yaml"
             _, validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_plan_reviewer(plan_version, review_out),
+                prompt=prompt_builder.build_plan_reviewer(plan_version, review_out, self._agent_timeout(config, "plan-reviewer")),
                 config=config,
                 expected_type="plan_review",
                 stage=PipelineStage.PLAN_REVIEW.value,
@@ -440,7 +440,7 @@ class Dispatcher:
             plan_fix_out = self.feature_dir / f"plan-v{plan_version}.yaml"
             _, plan_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out),
+                prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out, self._agent_timeout(config, "planner")),
                 config=config,
                 expected_type="plan",
                 stage=PipelineStage.PLAN_FIX.value,
@@ -508,7 +508,7 @@ class Dispatcher:
         manifest_out = self.feature_dir / "task-manifest.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out),
+            prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out, self._agent_timeout(config, "planner")),
             config=config,
             expected_type="task_manifest",
             stage=PipelineStage.TASK_BREAKDOWN.value,
@@ -534,7 +534,7 @@ class Dispatcher:
             task_review_out = self.feature_dir / f"task-review-v{iteration}.yaml"
             _, review_validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(task_review_out),
+                prompt=prompt_builder.build_task_reviewer(task_review_out, self._agent_timeout(config, "plan-reviewer")),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
@@ -562,7 +562,7 @@ class Dispatcher:
             task_fix_out = self.feature_dir / "task-manifest.yaml"
             _, manifest_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_task_fix(iteration, task_fix_out),
+                prompt=prompt_builder.build_task_fix(iteration, task_fix_out, self._agent_timeout(config, "planner")),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_FIX.value,
@@ -649,7 +649,7 @@ class Dispatcher:
         exec_out.parent.mkdir(parents=True, exist_ok=True)
         _, validation = self._invoke_validated_agent(
             agent="executor",
-            prompt=prompt_builder.build_executor(task_id, exec_out),
+            prompt=prompt_builder.build_executor(task_id, exec_out, self._agent_timeout(config, "executor")),
             config=config,
             expected_type="execution_result",
             stage=PipelineStage.TASK_EXECUTION.value,
@@ -714,7 +714,7 @@ class Dispatcher:
                 fix_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
                 self._invoke_agent(
                     agent="executor",
-                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out),
+                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out, self._agent_timeout(config, "executor")),
                     config=config,
                     stage=PipelineStage.FIX_ITERATION.value,
                     task_id=task_id,
@@ -727,7 +727,7 @@ class Dispatcher:
             review_out.parent.mkdir(parents=True, exist_ok=True)
             _, review_validation = self._invoke_validated_agent(
                 agent="reviewer",
-                prompt=prompt_builder.build_reviewer(task_id, review_out),
+                prompt=prompt_builder.build_reviewer(task_id, review_out, self._agent_timeout(config, "reviewer")),
                 config=config,
                 expected_type="review",
                 stage=PipelineStage.PER_TASK_QUALITY.value,
@@ -758,7 +758,7 @@ class Dispatcher:
             fix_out2 = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
             self._invoke_agent(
                 agent="executor",
-                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2),
+                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2, self._agent_timeout(config, "executor")),
                 config=config,
                 stage=PipelineStage.FIX_ITERATION.value,
                 task_id=task_id,
@@ -786,7 +786,7 @@ class Dispatcher:
             gap_out = self.feature_dir / f"gap-report-v{depth + 1}.yaml"
             _, validation = self._invoke_validated_agent(
                 agent="gap-detector",
-                prompt=prompt_builder.build_gap_detector(gap_out),
+                prompt=prompt_builder.build_gap_detector(gap_out, self._agent_timeout(config, "gap-detector")),
                 config=config,
                 expected_type="gap_report",
                 stage=PipelineStage.GAP_DETECTION.value,
@@ -816,7 +816,7 @@ class Dispatcher:
             gap_manifest_out = self.feature_dir / "task-manifest.yaml"
             result, task_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out),
+                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out, self._agent_timeout(config, "planner")),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_BREAKDOWN.value,
@@ -842,7 +842,7 @@ class Dispatcher:
             gap_review_out = self.feature_dir / f"task-review-v{new_manifest_version}.yaml"
             _, review_validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(gap_review_out),
+                prompt=prompt_builder.build_task_reviewer(gap_review_out, self._agent_timeout(config, "plan-reviewer")),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
@@ -862,6 +862,12 @@ class Dispatcher:
                 self._update_status(status="waiting_for_human", gate_reason="gap_execution_failed")
                 self.tui.warning("Gap re-entry tasks failed; pipeline blocked for human intervention.")
                 return False
+
+    def _agent_timeout(self, config: dict, agent: str) -> int:
+        """Look up the configured timeout (seconds) for an agent."""
+        agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
+        agent_config = config.get("agents", {}).get(agent_key, {})
+        return agent_config.get("timeout", 600)
 
     def _invoke_validated_agent(
         self,
@@ -1174,7 +1180,7 @@ class Dispatcher:
         review_out.parent.mkdir(parents=True, exist_ok=True)
         _, review_validation = self._invoke_validated_agent(
             agent="reviewer",
-            prompt=prompt_builder.build_reviewer(task_id, review_out),
+            prompt=prompt_builder.build_reviewer(task_id, review_out, self._agent_timeout(config, "reviewer")),
             config=config,
             expected_type="review",
             stage=PipelineStage.PER_TASK_QUALITY.value,

@@ -16,6 +16,7 @@ templates:
     - Put out-of-scope items into `constraints` if needed
     - Do not include alternate root keys like `kind`
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML output to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   planner: |
@@ -38,6 +39,7 @@ templates:
     - Efficiency by design: avoid specifying redundant operations, prefer batch over item-by-item where supported, note concurrency opportunities for independent operations, do not add blocking work to hot paths.
     - Quality constraints: prefer extending existing interfaces over new parameters, avoid specifying state that duplicates or could be derived, use existing constants/enums/typed values rather than raw strings.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML output to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   plan_reviewer: |
@@ -60,6 +62,7 @@ templates:
 
     Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
     The file must start with --- and contain only valid YAML conforming to PlanReviewOutput schema. Do not include prose or code block markers.
   plan_fix: |
@@ -70,6 +73,7 @@ templates:
 
     For reuse findings: replace newly specified utilities/patterns with references to existing codebase implementations. For overengineering findings: simplify the design — remove unnecessary abstractions, speculative generality, and indirection that does not serve current requirements. For efficiency findings: eliminate redundant operations and note concurrency opportunities.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the revised plan as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   task_breakdown: |
@@ -102,6 +106,7 @@ templates:
     - Do not assume Python or pytest unless the repository actually uses them
     - Aim for no more than 5 behavioral acceptance criteria per task; more suggests the task is doing too many unrelated things
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the task manifest as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to TaskManifestOutput schema. Do not include prose or code block markers.
   task_reviewer: |
@@ -120,6 +125,7 @@ templates:
 
     Reject the manifest if any task lacks a must_pass command-based acceptance criterion, if a command is missing, misplaced, obviously non-executable from the repo root, or mismatched to the repository's actual stack.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
     The file must start with --- and contain only valid YAML conforming to TaskManifestReviewOutput schema. Do not include prose or code block markers.
   task_fix: |
@@ -128,6 +134,7 @@ templates:
 
     Address all critical and major findings. Make the execution slices more precise, more independently verifiable, and less reliant on human interpretation. Every task must leave this stage with at least one concrete must_pass command in acceptance_criteria[].command. Do not bury commands in prose.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the revised task manifest as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   executor: |
@@ -148,6 +155,7 @@ templates:
 
     The repository may use any language, framework, build system, or test runner. Use the project's actual tooling and conventions.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the execution result as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ExecutionOutput schema. Do not include prose or code block markers.
   executor_fix: |
@@ -160,6 +168,7 @@ templates:
 
     Fix the issues against the existing working specification and keep the resulting code as the authoritative behavior. Use the repository's real verification commands. Report any new commit hashes created while fixing.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the execution result as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ExecutionOutput schema. Do not include prose or code block markers.
   tester: |
@@ -170,6 +179,7 @@ templates:
 
     Write tests that validate acceptance criteria using the repository's real test framework and conventions. The repository may not be Python; infer the test stack from the codebase before making changes.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the test results as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   reviewer: |
@@ -201,6 +211,7 @@ templates:
     - Use the repository's real stack expectations. Do not assume Python, pytest, or any specific framework unless present in the repo
     - Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the review as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ReviewOutput schema. Do not include prose or code block markers.
   gap_detector: |
@@ -215,6 +226,7 @@ templates:
 
     The project may use any language or platform. Evaluate gaps against the actual stack and deployment model, not Python-specific assumptions.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the gap report as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to GapOutput schema. Do not include prose or code block markers.
   tech_writer: |
@@ -226,5 +238,6 @@ templates:
 
     Update existing docs. Create new docs only for wholly new features. Documentation must describe the shipped code, not preserve or restate ephemeral planning artifacts. Use the documentation formats and conventions already present in the repository, whether Markdown, reStructuredText, inline code docs, generated docs, or framework-specific docs.
 
+    Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the docs report as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to DocsReportOutput schema. Do not include prose or code block markers.
