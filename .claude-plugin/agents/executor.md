@@ -69,8 +69,9 @@ Task: <absolute-or-feature-local-task-path>
 ```
 
 ## Output Format
-Respond with a single YAML document. Start with --- on its own line.
-Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
+Write your YAML output to the file path specified in the prompt using the Write tool.
+The file must contain a single valid YAML document starting with `---`.
+Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
 Output must conform to the `ExecutionOutput` schema (Section 9 — Canonical Schema Reference).
 All changed files go in a single `files_changed` list (with `action: created | modified | deleted`).

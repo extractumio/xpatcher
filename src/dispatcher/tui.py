@@ -43,6 +43,9 @@ class TUIRenderer:
     def info(self, text: str):
         print(f"  {text}")
 
+    def debug(self, text: str):
+        print(f"  {self.DIM}{self.CYAN}[debug]{self.RESET} {self.DIM}{text}{self.RESET}", file=sys.stderr)
+
     def human_gate(self, text: str):
         print(f"\n{self.BOLD}{self.YELLOW}{'─'*60}{self.RESET}")
         print(f"{self.BOLD}{self.YELLOW}  🔒 {text}{self.RESET}")

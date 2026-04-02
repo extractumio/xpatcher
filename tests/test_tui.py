@@ -33,9 +33,12 @@ class TestTUIRenderer:
         tui.warning("Slow response")
         tui.cost_update(1.2345)
         tui.error("Something failed")
+        tui.debug("Agent session abc-123")
         captured = capsys.readouterr()
 
         assert "Task completed" in captured.out
         assert "Slow response" in captured.out
         assert "1.2345" in captured.out
         assert "Something failed" in captured.err
+        assert "Agent session abc-123" in captured.err
+        assert "[debug]" in captured.err

@@ -5,16 +5,164 @@ import json
 import signal
 import subprocess
 import time
-from dataclasses import dataclass, field, replace
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 import yaml
 
+import sys
+
 from .auth import build_subprocess_env
-from .schemas import ArtifactValidator, ValidationResult
 from .yaml_utils import extract_yaml, load_yaml_file
+
+
+# ── Live session tailer ─────────────────────────────────────────────────────
+
+_DIM = "\033[2m"
+_CYAN = "\033[36m"
+_RESET = "\033[0m"
+
+
+class SessionTailer:
+    """Tails Claude Code JSONL conversation logs in real time.
+
+    Watches the project's Claude dir for JSONL files (main session + subagents)
+    and prints compact summaries of tool calls and text output to stderr.
+    """
+
+    def __init__(self, project_dir: Path, session_id: str):
+        slug = str(project_dir).replace("/", "-")
+        self._watch_dir = Path.home() / ".claude" / "projects" / slug
+        self._session_id = session_id
+        self._files: dict[Path, int] = {}  # path -> bytes read offset
+        self._known_files: set[Path] = set()
+
+    def poll(self) -> None:
+        """Check for new content in all session JSONL files."""
+        if not self._watch_dir.exists():
+            return
+        # Discover new JSONL files (subagents)
+        for path in self._watch_dir.glob("*.jsonl"):
+            if path not in self._known_files:
+                self._known_files.add(path)
+                self._files[path] = 0
+        # Read new lines from each file
+        for path, offset in list(self._files.items()):
+            try:
+                size = path.stat().st_size
+                if size <= offset:
+                    continue
+                with open(path) as f:
+                    f.seek(offset)
+                    new_data = f.read()
+                    self._files[path] = f.tell()
+                for line in new_data.splitlines():
+                    self._print_event(line, path)
+            except (OSError, ValueError):
+                pass
+
+    def _print_event(self, line: str, path: Path) -> None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        etype = event.get("type")
+        # Show the session file stem only if it's a subagent (not main session)
+        prefix = ""
+        if path.stem != self._session_id:
+            prefix = f"[{path.stem[:8]}] "
+
+        if etype == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                bt = block.get("type")
+                if bt == "tool_use":
+                    name = block.get("name", "?")
+                    inp = block.get("input", {})
+                    detail = self._tool_summary(name, inp)
+                    self._emit(f"{prefix}{name}: {detail}")
+                elif bt == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        # Show first line only, truncated
+                        first = text.split("\n")[0][:120]
+                        self._emit(f"{prefix}{first}")
+        elif etype == "agent-setting":
+            agent = event.get("agentSetting", "")
+            if agent:
+                self._emit(f"{prefix}agent: {agent}")
+
+    @staticmethod
+    def _tool_summary(name: str, inp: dict) -> str:
+        if name in ("Read", "read"):
+            return inp.get("file_path", "?")
+        if name in ("Write", "write"):
+            return inp.get("file_path", "?")
+        if name in ("Edit", "edit"):
+            return inp.get("file_path", "?")
+        if name in ("Bash", "bash"):
+            cmd = inp.get("command", "?")
+            return cmd[:100] + ("..." if len(cmd) > 100 else "")
+        if name in ("Glob", "glob"):
+            return inp.get("pattern", "?")
+        if name in ("Grep", "grep"):
+            return f'/{inp.get("pattern", "?")}/  {inp.get("path", "")}'
+        if name == "Agent":
+            return inp.get("description", inp.get("prompt", "?"))[:80]
+        return str(inp)[:80]
+
+    @staticmethod
+    def _emit(text: str) -> None:
+        print(f"  {_DIM}{_CYAN}│{_RESET} {_DIM}{text}{_RESET}", file=sys.stderr, flush=True)
+
+
+# ── Agent JSON baking ────────────────────────────────────────────────────────
+
+# Fields from agent .md frontmatter that --agents JSON supports.
+# 'memory' is intentionally excluded — it silently breaks --agents parsing
+# in Claude Code CLI ≤2.1.89.
+_SUPPORTED_AGENT_FIELDS = frozenset({
+    "description", "model", "maxTurns", "tools",
+    "disallowedTools", "effort",
+})
+
+
+def bake_agents_json(
+    agents_dir: Path,
+    output_path: Path,
+    plugin_name: str = "xpatcher",
+) -> dict[str, dict]:
+    """Parse agent .md files and write a --agents-compatible JSON file.
+
+    Returns the agents dict (keyed by ``plugin_name:agent_name``).
+    """
+    agents: dict[str, dict] = {}
+    for md_file in sorted(agents_dir.glob("*.md")):
+        text = md_file.read_text()
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            continue
+        meta = yaml.safe_load(parts[1])
+        if not isinstance(meta, dict):
+            continue
+        body = parts[2].strip()
+        name = meta.get("name", md_file.stem)
+        agent_def: dict = {
+            "description": str(meta.get("description", "")).strip(),
+            "prompt": body,
+        }
+        for key in _SUPPORTED_AGENT_FIELDS - {"description"}:
+            if key in meta:
+                agent_def[key] = meta[key]
+        agents[f"{plugin_name}:{name}"] = agent_def
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(agents))
+    return agents
 
 
 @dataclass
@@ -29,9 +177,11 @@ class AgentInvocation:
     disallowed_tools: Optional[list[str]] = None
     model: Optional[str] = None
     permission_mode: str = "bypassPermissions"
+    resume: bool = False
     cancel_check: Optional[Callable[[], bool]] = None
     command_template: Optional[list[str]] = None
     resume_args_template: Optional[list[str]] = None
+    debug_tailer: Optional[SessionTailer] = None
 
 
 @dataclass
@@ -81,6 +231,12 @@ class ClaudeSession:
         self.project_dir = project_dir
         self.plugin_name = self.PLUGIN_NAME
         self._subprocess_env = build_subprocess_env(auth_env or {})
+        self._agents_json: str | None = None
+        agents_path = plugin_dir / "agents.json"
+        if agents_path.is_file():
+            raw = agents_path.read_text()
+            json.loads(raw)  # fail fast on corrupt file
+            self._agents_json = raw
 
     def _required_agents(self, plugin_name: str | None = None) -> list[str]:
         active_name = plugin_name or self.plugin_name or self.PLUGIN_NAME
@@ -95,6 +251,8 @@ class ClaudeSession:
             "--max-turns", "1",
             "--permission-mode", "bypassPermissions",
         ]
+        if self._agents_json:
+            cmd.extend(["--agents", self._agents_json])
 
         try:
             result = subprocess.run(
@@ -155,10 +313,12 @@ class ClaudeSession:
                 error=f"Plugin '{self.PLUGIN_NAME}' not loaded. Found: {plugins}",
                 cli_version=init_event.get("claude_code_version", ""),
             )
-        self.plugin_name = plugin_record.get("name", self.PLUGIN_NAME)
+        # Note: plugin_record["name"] is the directory name (e.g. ".claude-plugin"),
+        # NOT necessarily the agent prefix. Agents are baked with PLUGIN_NAME prefix,
+        # so we keep self.plugin_name = PLUGIN_NAME for agent name construction.
 
         agents = init_event.get("agents", [])
-        missing = [a for a in self._required_agents(self.plugin_name) if a not in agents]
+        missing = [a for a in self._required_agents() if a not in agents]
         if missing:
             return PreflightResult(
                 ok=False,
@@ -175,12 +335,43 @@ class ClaudeSession:
             cost_usd=result_event.get("total_cost_usd", 0.0) if result_event else 0.0,
         )
 
+    def preview_cmd(self, invocation: AgentInvocation) -> str:
+        """Return a human-readable command string for debug output.
+
+        Strips prompt text and agents JSON to keep the output scannable.
+        """
+        if invocation.command_template:
+            cmd = self._build_cmd_from_template(invocation)
+        else:
+            cmd = self._build_cmd_legacy(invocation)
+        sanitized = []
+        skip_next = False
+        for i, arg in enumerate(cmd):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in ("-p", "--prompt"):
+                sanitized.append(arg)
+                sanitized.append("'...'")
+                skip_next = True
+            elif arg == "--agents":
+                sanitized.append(arg)
+                sanitized.append("'{...}'")
+                skip_next = True
+            else:
+                sanitized.append(arg)
+        return " ".join(sanitized)
+
     def invoke(self, invocation: AgentInvocation) -> AgentResult:
         """Invoke a Claude agent via CLI."""
         if invocation.command_template:
             cmd = self._build_cmd_from_template(invocation)
         else:
             cmd = self._build_cmd_legacy(invocation)
+
+        # Inject pre-assigned session ID if set but not already a --resume
+        if invocation.session_id and "--resume" not in cmd and "--session-id" not in cmd:
+            cmd.extend(["--session-id", invocation.session_id])
 
         return self._run_cmd(cmd, invocation)
 
@@ -189,9 +380,17 @@ class ClaudeSession:
         subs = {
             "{prompt}": invocation.prompt,
             "{plugin_dir}": str(self.plugin_dir),
+            "{agents_json}": self._agents_json or "",
         }
         cmd = [subs.get(arg, arg) for arg in invocation.command_template]
-        if invocation.session_id and invocation.resume_args_template:
+        # Drop --agents with empty value (happens when no agents.json exists)
+        try:
+            idx = cmd.index("--agents")
+            if idx + 1 < len(cmd) and cmd[idx + 1] == "":
+                del cmd[idx:idx + 2]
+        except ValueError:
+            pass
+        if invocation.resume and invocation.session_id and invocation.resume_args_template:
             resume_subs = {"{session_id}": invocation.session_id}
             cmd.extend(resume_subs.get(arg, arg) for arg in invocation.resume_args_template)
         return cmd
@@ -204,12 +403,14 @@ class ClaudeSession:
             "--plugin-dir", str(self.plugin_dir),
             "--permission-mode", invocation.permission_mode,
         ]
+        if self._agents_json:
+            cmd.extend(["--agents", self._agents_json])
         if invocation.agent:
             qualified = invocation.agent
             if ":" not in qualified:
                 qualified = f"{self.plugin_name}:{qualified}"
             cmd.extend(["--agent", qualified])
-        if invocation.session_id:
+        if invocation.resume and invocation.session_id:
             cmd.extend(["--resume", invocation.session_id])
         if invocation.max_turns:
             cmd.extend(["--max-turns", str(invocation.max_turns)])
@@ -250,19 +451,25 @@ class ClaudeSession:
             stderr = ""
             cancelled = False
 
-            while True:
-                if invocation.cancel_check():
-                    cancelled = True
-                    self._terminate_process(proc)
-                    stdout, stderr = proc.communicate()
-                    break
-                if proc.poll() is not None:
-                    stdout, stderr = proc.communicate()
-                    break
-                if time.monotonic() - start > invocation.timeout:
-                    self._terminate_process(proc)
-                    raise subprocess.TimeoutExpired(cmd, invocation.timeout)
-                time.sleep(0.25)
+            try:
+                while True:
+                    if invocation.cancel_check():
+                        cancelled = True
+                        self._terminate_process(proc)
+                        stdout, stderr = proc.communicate()
+                        break
+                    if proc.poll() is not None:
+                        stdout, stderr = proc.communicate()
+                        break
+                    if time.monotonic() - start > invocation.timeout:
+                        self._terminate_process(proc)
+                        raise subprocess.TimeoutExpired(cmd, invocation.timeout)
+                    if invocation.debug_tailer:
+                        invocation.debug_tailer.poll()
+                    time.sleep(0.25)
+            except KeyboardInterrupt:
+                self._terminate_process(proc)
+                raise
 
         try:
             events = json.loads(stdout) if stdout else []
@@ -320,47 +527,6 @@ class ClaudeSession:
         except Exception:
             proc.kill()
 
-class MalformedOutputRecovery:
-    """Retries agent invocations with targeted fix prompts on malformed output."""
-
-    MAX_FIX_ATTEMPTS = 2
-
-    def __init__(self, session: ClaudeSession, validator: ArtifactValidator):
-        self.session = session
-        self.validator = validator
-
-    def invoke_with_validation(
-        self, invocation: AgentInvocation, expected_type: str
-    ) -> tuple[AgentResult, ValidationResult]:
-        """Invoke agent with up to MAX_FIX_ATTEMPTS retries for malformed output."""
-        result = self.session.invoke(invocation)
-        validation = self.validator.validate(result.raw_text, expected_type)
-
-        for _attempt in range(self.MAX_FIX_ATTEMPTS):
-            if validation.valid:
-                break
-
-            fix_prompt = self._build_fix_prompt(validation.errors, expected_type)
-            fix_invocation = replace(
-                invocation,
-                prompt=fix_prompt,
-                session_id=result.session_id,
-            )
-            result = self.session.invoke(fix_invocation)
-            validation = self.validator.validate(result.raw_text, expected_type)
-
-        return result, validation
-
-    def _build_fix_prompt(self, errors: list[str], expected_type: str) -> str:
-        error_list = "\n".join(f"- {e}" for e in errors)
-        return (
-            f"Your previous output had validation errors. Please fix and resubmit.\n\n"
-            f"Expected artifact type: {expected_type}\n\n"
-            f"Errors:\n{error_list}\n\n"
-            f"Respond with ONLY the corrected YAML document. Start with --- on its own line."
-        )
-
-
 class SessionRecord:
     """A single session record in the registry."""
 
@@ -380,6 +546,9 @@ class SessionRecord:
         self.last_used_at = self.created_at
         self.turn_count = 0
         self.token_estimate = 0
+        self.duration_ms = 0
+        self.cost_usd = 0.0
+        self.claude_debug_log = ""
         self.compacted = False
 
 
@@ -409,10 +578,15 @@ class SessionRegistry:
     ) -> str:
         rec = SessionRecord(result.session_id, agent_type, stage, task_id)
         rec.turn_count = result.num_turns
+        rec.duration_ms = result.duration_ms
+        rec.cost_usd = result.cost_usd
         if result.usage:
             rec.token_estimate = (
                 result.usage.get("input_tokens", 0) + result.usage.get("output_tokens", 0)
             )
+        debug_log = Path.home() / ".claude" / "debug" / f"{result.session_id}.txt"
+        if debug_log.exists():
+            rec.claude_debug_log = str(debug_log)
         self._sessions[result.session_id] = rec
         self._save()
         return result.session_id
@@ -432,7 +606,7 @@ class SessionRegistry:
     def _save(self) -> None:
         data: dict = {"sessions": {}}
         for sid, rec in self._sessions.items():
-            data["sessions"][sid] = {
+            entry: dict = {
                 "agent_type": rec.agent_type,
                 "stage": rec.stage,
                 "task_id": rec.task_id,
@@ -440,7 +614,12 @@ class SessionRegistry:
                 "last_used_at": rec.last_used_at,
                 "turn_count": rec.turn_count,
                 "token_estimate": rec.token_estimate,
+                "duration_ms": rec.duration_ms,
+                "cost_usd": rec.cost_usd,
             }
+            if rec.claude_debug_log:
+                entry["claude_debug_log"] = rec.claude_debug_log
+            data["sessions"][sid] = entry
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.registry_path.write_text(
             yaml.dump(data, default_flow_style=False, sort_keys=False)

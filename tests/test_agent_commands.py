@@ -53,6 +53,7 @@ class TestAgentConfig:
         assert all(isinstance(agents[key]["command"], list) for key in EXPECTED_AGENT_KEYS)
         assert all("{prompt}" in agents[key]["command"] for key in EXPECTED_AGENT_KEYS)
         assert all("{plugin_dir}" in agents[key]["command"] for key in EXPECTED_AGENT_KEYS)
+        assert all("{agents_json}" in agents[key]["command"] for key in EXPECTED_AGENT_KEYS)
 
     def test_templates_build_fully_substituted_commands_for_every_agent(self):
         session = ClaudeSession(Path("/opt/xpatcher/.claude-plugin"), Path("/workspace/project"))
@@ -61,6 +62,7 @@ class TestAgentConfig:
             invocation = AgentInvocation(
                 prompt="ship it",
                 session_id="sess-123",
+                resume=True,
                 command_template=agent_cfg["command"],
                 resume_args_template=agent_cfg.get("resume_args"),
             )

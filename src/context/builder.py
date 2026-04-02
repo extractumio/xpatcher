@@ -41,58 +41,58 @@ class PromptBuilder:
     def _escape(value) -> str:
         return str(value).replace("$", "$$")
 
-    def build_intent_capture(self, description: str) -> str:
-        return self._render("intent_capture", description=description)
+    def build_intent_capture(self, description: str, output_path: Path) -> str:
+        return self._render("intent_capture", description=description, output_path=output_path)
 
-    def build_planner(self) -> str:
+    def build_planner(self, output_path: Path) -> str:
         intent_path = self.feature_dir / "intent.yaml"
         self._require_file(intent_path, "intent.yaml")
-        return self._render("planner", intent_path=intent_path)
+        return self._render("planner", intent_path=intent_path, output_path=output_path)
 
-    def build_plan_reviewer(self, plan_version: int) -> str:
+    def build_plan_reviewer(self, plan_version: int, output_path: Path) -> str:
         plan_path = self.feature_dir / f"plan-v{plan_version}.yaml"
         intent_path = self.feature_dir / "intent.yaml"
         self._require_file(plan_path, f"plan-v{plan_version}.yaml")
-        return self._render("plan_reviewer", plan_path=plan_path, intent_path=intent_path)
+        return self._render("plan_reviewer", plan_path=plan_path, intent_path=intent_path, output_path=output_path)
 
-    def build_plan_fix(self, previous_version: int) -> str:
+    def build_plan_fix(self, previous_version: int, output_path: Path) -> str:
         review_path = self.feature_dir / f"plan-review-v{previous_version}.yaml"
         plan_path = self.feature_dir / f"plan-v{previous_version}.yaml"
-        return self._render("plan_fix", review_path=review_path, plan_path=plan_path)
+        return self._render("plan_fix", review_path=review_path, plan_path=plan_path, output_path=output_path)
 
-    def build_task_breakdown(self, plan_version: int) -> str:
+    def build_task_breakdown(self, plan_version: int, output_path: Path) -> str:
         plan_path = self.feature_dir / f"plan-v{plan_version}.yaml"
-        return self._render("task_breakdown", plan_path=plan_path)
+        return self._render("task_breakdown", plan_path=plan_path, output_path=output_path)
 
-    def build_task_reviewer(self) -> str:
+    def build_task_reviewer(self, output_path: Path) -> str:
         manifest_path = self.feature_dir / "task-manifest.yaml"
         self._require_file(manifest_path, "task-manifest.yaml")
-        return self._render("task_reviewer", manifest_path=manifest_path)
+        return self._render("task_reviewer", manifest_path=manifest_path, output_path=output_path)
 
-    def build_task_fix(self, review_version: int) -> str:
+    def build_task_fix(self, review_version: int, output_path: Path) -> str:
         review_path = self.feature_dir / f"task-review-v{review_version}.yaml"
         manifest_path = self.feature_dir / "task-manifest.yaml"
-        return self._render("task_fix", review_path=review_path, manifest_path=manifest_path)
+        return self._render("task_fix", review_path=review_path, manifest_path=manifest_path, output_path=output_path)
 
-    def build_executor(self, task_id: str) -> str:
+    def build_executor(self, task_id: str, output_path: Path) -> str:
         task_file = self._find_task_file(task_id)
-        return self._render("executor", task_id=task_id, task_file=task_file)
+        return self._render("executor", task_id=task_id, task_file=task_file, output_path=output_path)
 
-    def build_executor_fix(self, task_id: str, findings: list) -> str:
+    def build_executor_fix(self, task_id: str, findings: list, output_path: Path) -> str:
         findings_text = yaml.safe_dump(findings, default_flow_style=False) if findings else "No specific findings"
-        return self._render("executor_fix", task_id=task_id, findings_text=findings_text)
+        return self._render("executor_fix", task_id=task_id, findings_text=findings_text, output_path=output_path)
 
-    def build_tester(self, task_id: str) -> str:
-        return self._render("tester", task_id=task_id)
+    def build_tester(self, task_id: str, output_path: Path) -> str:
+        return self._render("tester", task_id=task_id, output_path=output_path)
 
-    def build_reviewer(self, task_id: str) -> str:
-        return self._render("reviewer", task_id=task_id)
+    def build_reviewer(self, task_id: str, output_path: Path) -> str:
+        return self._render("reviewer", task_id=task_id, output_path=output_path)
 
-    def build_gap_detector(self) -> str:
-        return self._render("gap_detector")
+    def build_gap_detector(self, output_path: Path) -> str:
+        return self._render("gap_detector", output_path=output_path)
 
-    def build_tech_writer(self) -> str:
-        return self._render("tech_writer")
+    def build_tech_writer(self, output_path: Path) -> str:
+        return self._render("tech_writer", output_path=output_path)
 
     def _require_file(self, path: Path, name: str):
         if not path.exists():

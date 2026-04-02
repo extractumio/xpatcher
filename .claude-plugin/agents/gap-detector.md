@@ -8,6 +8,7 @@ model: opus
 maxTurns: 25
 tools:
   - Read
+  - Write
   - Glob
   - Grep
   - Bash(git log:git diff:git show:git blame:ls:wc)
@@ -57,8 +58,9 @@ Example: if the original specification had 10 tasks, gap detection may produce a
 remediation tasks.
 
 ## Output Format
-Respond with a single YAML document. Start with --- on its own line.
-Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
+Write your YAML output to the file path specified in the prompt using the Write tool.
+The file must contain a single valid YAML document starting with `---`.
+Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
 Output must conform to the `GapOutput` schema (Section 9 — Canonical Schema Reference).
 Gap severity: `critical | major | minor`. Gap category: `plan-coverage | error-handling | edge-case | migration | documentation | integration`.
@@ -66,7 +68,7 @@ Gap severity: `critical | major | minor`. Gap category: `plan-coverage | error-h
 <!-- At build time, the full GapOutput schema is injected here from the Pydantic model. -->
 
 ## Constraints
-- You MUST NOT modify any files. You are read-only.
+- You MUST NOT modify any project files. You MAY only use Write to save the output artifact to the path specified in the prompt.
 - Be thorough but practical. Focus on gaps that would cause production issues.
 - Do not re-do the reviewer's job. Focus on structural and systemic gaps.
 - Only identify requirements a reasonable user would consider essential for the

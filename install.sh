@@ -113,6 +113,7 @@ cat > "$INSTALL_DIR/bin/xpatcher" << 'ENTRY'
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
 export XPATCHER_HOME="$SCRIPT_DIR"
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 exec "$SCRIPT_DIR/.venv/bin/python" -m src.dispatcher.core "$@"
 ENTRY
 chmod +x "$INSTALL_DIR/bin/xpatcher"
@@ -131,7 +132,30 @@ chmod +x "$INSTALL_DIR/.claude-plugin/hooks/run_hook.sh"
 ok "Hook wrapper installed"
 
 # ---------------------------------------------------------------------------
-# 8. Resolve authentication for --bare mode
+# 8. Bake agents.json for --bare mode (--bare skips plugin agent discovery)
+# ---------------------------------------------------------------------------
+"$INSTALL_DIR/.venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$INSTALL_DIR')
+from pathlib import Path
+from src.dispatcher.session import bake_agents_json
+agents_dir = Path('$INSTALL_DIR/.claude-plugin/agents')
+output = Path('$INSTALL_DIR/.claude-plugin/agents.json')
+agents = bake_agents_json(agents_dir, output)
+print(f'{len(agents)} agents baked')
+for name in sorted(agents):
+    print(f'  {name}')
+" 2>&1
+
+BAKE_EXIT=$?
+if [ "$BAKE_EXIT" != "0" ]; then
+    err "Failed to bake agents.json"
+    exit 1
+fi
+ok "agents.json generated"
+
+# ---------------------------------------------------------------------------
+# 9. Resolve authentication for --bare mode
 # ---------------------------------------------------------------------------
 echo ""
 printf "${BOLD}${BLUE}  Authentication${RESET}\n"
@@ -169,16 +193,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Smoke test: verify Claude Code CLI + plugin loading
+# 10. Smoke test: verify Claude Code CLI + plugin loading
 # ---------------------------------------------------------------------------
 echo ""
 printf "${BOLD}${BLUE}  Smoke Test${RESET}\n"
 
+# Read the baked agents JSON
+AGENTS_JSON=$(cat "$INSTALL_DIR/.claude-plugin/agents.json" 2>/dev/null)
+
 SMOKE_OUTPUT=""
 SMOKE_EXIT=0
-SMOKE_OUTPUT=$(${AUTH_ENV[@]+"${AUTH_ENV[@]}"} claude --bare -p "respond with ok" --output-format json \
-    --plugin-dir "$INSTALL_DIR/.claude-plugin/" \
-    --max-turns 1 --permission-mode bypassPermissions 2>&1) || SMOKE_EXIT=$?
+SMOKE_CMD=(claude --bare -p "respond with ok" --output-format json
+    --plugin-dir "$INSTALL_DIR/.claude-plugin/"
+    --max-turns 1 --permission-mode bypassPermissions)
+if [ -n "$AGENTS_JSON" ]; then
+    SMOKE_CMD+=(--agents "$AGENTS_JSON")
+fi
+SMOKE_OUTPUT=$(${AUTH_ENV[@]+"${AUTH_ENV[@]}"} "${SMOKE_CMD[@]}" 2>&1) || SMOKE_EXIT=$?
 
 if [ "$SMOKE_EXIT" != "0" ]; then
     warn "Claude Code CLI smoke test failed (exit code $SMOKE_EXIT)"
@@ -202,7 +233,6 @@ except (json.JSONDecodeError, ValueError):
     print('WARNING: Could not parse smoke test output as JSON')
     sys.exit(1)
 
-# Handle both array-of-events and single-event formats
 if isinstance(events, dict):
     events = [events]
 
@@ -225,12 +255,14 @@ if not plugin:
     print(f'WARNING: Plugin for path $INSTALL_DIR/.claude-plugin not found in loaded plugins: {plugins}')
     sys.exit(1)
 
-plugin_name = plugin.get('name', 'xpatcher')
-xp_agents = [a for a in agents if a.startswith(f'{plugin_name}:')]
+# plugin_record['name'] is the directory name (e.g. '.claude-plugin'), not the agent prefix.
+# Agents are baked with 'xpatcher:' prefix, so match on that directly.
+xp_agents = [a for a in agents if a.startswith('xpatcher:')]
 if len(xp_agents) < 9:
+    print(f'WARNING: Expected 9+ agents, found {len(xp_agents)}: {xp_agents}')
     sys.exit(1)
 
-print(f'[ok] Claude Code CLI v{version} -- plugin loaded as {plugin_name}, {len(xp_agents)} agents registered')
+print(f'[ok] Claude Code CLI v{version} -- plugin loaded, {len(xp_agents)} agents registered')
 " 2>/dev/null; then
         :  # Success message already printed
     else
@@ -241,7 +273,7 @@ print(f'[ok] Claude Code CLI v{version} -- plugin loaded as {plugin_name}, {len(
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Add to PATH in shell rc files (idempotent, supports bash + zsh)
+# 11. Add to PATH in shell rc files (idempotent, supports bash + zsh)
 # ---------------------------------------------------------------------------
 echo ""
 printf "${BOLD}${BLUE}  PATH Setup${RESET}\n"

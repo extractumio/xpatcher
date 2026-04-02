@@ -8,14 +8,16 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .auth import resolve_auth_env, describe_auth_source
 from .state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
-from .session import AgentInvocation, AgentResult, ClaudeSession, MalformedOutputRecovery, SessionRegistry
+from .session import AgentInvocation, AgentResult, ClaudeSession, SessionRegistry, SessionTailer
 from .schemas import ArtifactValidator, ValidationResult
 from .tui import TUIRenderer
 from .yaml_utils import load_yaml_file
@@ -53,6 +55,14 @@ def _project_storage_slug(project_dir: Path) -> str:
 
 def _branch_name_for(feature_slug: str) -> str:
     return f"xpatcher/{feature_slug}"
+
+
+def _home_relative(path: Path) -> str:
+    """Return path with $HOME replaced by ~."""
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
 
 
 def _pipeline_index_dir(xpatcher_home: Path) -> Path:
@@ -109,14 +119,14 @@ def _find_all_pipeline_records(xpatcher_home: Path) -> dict[str, dict]:
 
 
 class Dispatcher:
-    def __init__(self, project_dir: Path, xpatcher_home: Path):
+    def __init__(self, project_dir: Path, xpatcher_home: Path, debug: bool = False):
         self.project_dir = project_dir
         self.xpatcher_home = xpatcher_home
         self.plugin_dir = xpatcher_home / ".claude-plugin"
+        self.debug = debug
         self._auth_env = resolve_auth_env(xpatcher_home)
         self.session = ClaudeSession(self.plugin_dir, project_dir, self._auth_env)
         self.validator = ArtifactValidator()
-        self.recovery = MalformedOutputRecovery(self.session, self.validator)
         self.tui = TUIRenderer()
         self.total_cost_usd = 0.0
         self.state_file: PipelineStateFile | None = None
@@ -137,7 +147,7 @@ class Dispatcher:
     def _feature_dir_for(self, feature_slug: str) -> Path:
         return self.xpatcher_home / ".xpatcher" / "projects" / _project_storage_slug(self.project_dir) / feature_slug
 
-    def start(self, description: str, verbose: bool = False):
+    def start(self, description: str, verbose: bool = False, debug: bool = False):
         """Start a new pipeline."""
         self.tui.status("Running preflight checks...")
         preflight = self.session.preflight()
@@ -149,6 +159,16 @@ class Dispatcher:
 
         if not (self.project_dir / ".git").is_dir():
             self.tui.error("Not a git repository")
+            sys.exit(1)
+
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(self.project_dir),
+            capture_output=True, text=True,
+        )
+        if dirty.stdout.strip():
+            self.tui.error("Working tree has uncommitted changes. Commit or stash before starting a pipeline.")
+            self.tui.info(dirty.stdout.rstrip())
             sys.exit(1)
 
         pipeline_id = generate_pipeline_id()
@@ -200,9 +220,11 @@ class Dispatcher:
 
         self.tui.header(f"Pipeline {pipeline_id}: {description}")
         try:
-            self._run_pipeline(sm, store, prompt_builder, config, description, verbose)
+            self._run_pipeline(sm, store, prompt_builder, config, description, verbose, debug)
         except CancelledPipelineError:
             self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
+        except KeyboardInterrupt:
+            self._handle_interrupt(sm, pipeline_id)
 
     def resume(self, pipeline_id: str):
         record = _find_pipeline_record(self.xpatcher_home, pipeline_id)
@@ -226,60 +248,61 @@ class Dispatcher:
         self.tui.header(f"Resuming {pipeline_id}")
         self._require_auth()
 
-        if gate_reason == "plan_approval" and current in {PipelineStage.PAUSED, PipelineStage.PLAN_APPROVAL}:
-            sm = PipelineStateMachine(self.state_file)
-            store = ArtifactStore(feature_dir)
-            prompt_builder = PromptBuilder(feature_dir, self.project_dir)
-            try:
+        try:
+            if gate_reason == "plan_approval" and current in {PipelineStage.PAUSED, PipelineStage.PLAN_APPROVAL}:
+                sm = PipelineStateMachine(self.state_file)
+                store = ArtifactStore(feature_dir)
+                prompt_builder = PromptBuilder(feature_dir, self.project_dir)
                 approved = self._handle_plan_approval(sm, store, prompt_builder, config, transition_stage=False)
-            except CancelledPipelineError:
-                self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
+                if not approved:
+                    return
+                plan_version = store.latest_version("plan")
+                manifest_version = self._run_task_breakdown_and_review(
+                    sm,
+                    store,
+                    prompt_builder,
+                    config,
+                    plan_version=plan_version,
+                    manifest_version=max(1, store.latest_version("task-manifest")),
+                )
+                if manifest_version is None:
+                    return
+                if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
+                    return
+                if not self._run_gap_detection_with_reentry(sm, store, prompt_builder, config, plan_version):
+                    return
+                sm.transition(PipelineStage.DOCUMENTATION)
+                self.tui.stage("Stage 15: Documentation")
+                docs_out = self.feature_dir / "docs-report.yaml"
+                _, validation = self._invoke_validated_agent(
+                    agent="tech-writer",
+                    prompt=prompt_builder.build_tech_writer(docs_out),
+                    config=config,
+                    expected_type="docs_report",
+                    stage=PipelineStage.DOCUMENTATION.value,
+                    output_path=docs_out,
+                )
+                if not validation.valid:
+                    self._fail_pipeline(sm, f"Docs validation failed: {validation.errors}")
+                    return
+                store.save("docs-report.yaml", validation.data)
+                sm.transition(PipelineStage.COMPLETION)
+                self._handle_completion_gate(sm, store, transition_stage=False)
                 return
-            if not approved:
-                return
-            plan_version = store.latest_version("plan")
-            manifest_version = self._run_task_breakdown_and_review(
-                sm,
-                store,
-                prompt_builder,
-                config,
-                plan_version=plan_version,
-                manifest_version=max(1, store.latest_version("task-manifest")),
-            )
-            if manifest_version is None:
-                return
-            if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
-                return
-            if not self._run_gap_detection_with_reentry(sm, store, prompt_builder, config, plan_version):
-                return
-            sm.transition(PipelineStage.DOCUMENTATION)
-            self.tui.stage("Stage 15: Documentation")
-            _, validation = self._invoke_validated_agent(
-                agent="tech-writer",
-                prompt=prompt_builder.build_tech_writer(),
-                config=config,
-                expected_type="docs_report",
-                stage=PipelineStage.DOCUMENTATION.value,
-            )
-            if not validation.valid:
-                self._fail_pipeline(sm, f"Docs validation failed: {validation.errors}")
-                return
-            store.save("docs-report.yaml", validation.data)
-            sm.transition(PipelineStage.COMPLETION)
-            self._handle_completion_gate(sm, store, transition_stage=False)
-            return
 
-        if gate_reason == "completion" and current in {PipelineStage.PAUSED, PipelineStage.COMPLETION}:
-            try:
+            if gate_reason == "completion" and current in {PipelineStage.PAUSED, PipelineStage.COMPLETION}:
                 self._handle_completion_gate(PipelineStateMachine(self.state_file), ArtifactStore(feature_dir), transition_stage=False)
-            except CancelledPipelineError:
-                self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
-            return
+                return
 
-        self.tui.info(
-            "Resume supports paused human gates. For execution-stage recovery, use "
-            "`status`, `skip`, `cancel`, or rerun once the pipeline is unblocked."
-        )
+            self.tui.info(
+                "Resume supports paused human gates. For execution-stage recovery, use "
+                "`status`, `skip`, `cancel`, or rerun once the pipeline is unblocked."
+            )
+        except CancelledPipelineError:
+            self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
+        except KeyboardInterrupt:
+            sm = PipelineStateMachine(self.state_file)
+            self._handle_interrupt(sm, pipeline_id)
 
     def _run_pipeline(
         self,
@@ -289,19 +312,23 @@ class Dispatcher:
         config: dict,
         description: str,
         verbose: bool,
+        debug: bool = False,
     ) -> None:
         del verbose
+        self.debug = debug
         self._raise_if_cancelled()
 
         sm.transition(PipelineStage.INTENT_CAPTURE)
         self._update_status(status="running")
         self.tui.stage("Stage 1: Intent Capture")
+        intent_path = self.feature_dir / "intent.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_intent_capture(description),
+            prompt=prompt_builder.build_intent_capture(description, intent_path),
             config=config,
             expected_type="intent",
             stage=PipelineStage.INTENT_CAPTURE.value,
+            output_path=intent_path,
         )
         if not validation.valid:
             self._fail_pipeline(sm, f"Intent validation failed: {validation.errors}")
@@ -310,12 +337,14 @@ class Dispatcher:
 
         sm.transition(PipelineStage.PLANNING)
         self.tui.stage("Stage 2: Planning")
+        plan_v1_path = self.feature_dir / "plan-v1.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_planner(),
+            prompt=prompt_builder.build_planner(plan_v1_path),
             config=config,
             expected_type="plan",
             stage=PipelineStage.PLANNING.value,
+            output_path=plan_v1_path,
         )
         if not validation.valid:
             self._fail_pipeline(sm, f"Plan validation failed: {validation.errors}")
@@ -348,12 +377,14 @@ class Dispatcher:
 
         sm.transition(PipelineStage.DOCUMENTATION)
         self.tui.stage("Stage 15: Documentation")
+        docs_out = self.feature_dir / "docs-report.yaml"
         _, validation = self._invoke_validated_agent(
             agent="tech-writer",
-            prompt=prompt_builder.build_tech_writer(),
+            prompt=prompt_builder.build_tech_writer(docs_out),
             config=config,
             expected_type="docs_report",
             stage=PipelineStage.DOCUMENTATION.value,
+            output_path=docs_out,
         )
         if not validation.valid:
             self._fail_pipeline(sm, f"Docs validation failed: {validation.errors}")
@@ -378,12 +409,14 @@ class Dispatcher:
             self._raise_if_cancelled()
             sm.transition(PipelineStage.PLAN_REVIEW)
             self.tui.stage(f"Stage 3: Plan Review (iteration {iteration})")
+            review_out = self.feature_dir / f"plan-review-v{plan_version}.yaml"
             _, validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_plan_reviewer(plan_version),
+                prompt=prompt_builder.build_plan_reviewer(plan_version, review_out),
                 config=config,
                 expected_type="plan_review",
                 stage=PipelineStage.PLAN_REVIEW.value,
+                output_path=review_out,
             )
             if not validation.valid:
                 self._fail_pipeline(sm, f"Plan review validation failed: {validation.errors}")
@@ -404,12 +437,14 @@ class Dispatcher:
             sm.transition(PipelineStage.PLAN_FIX)
             self.tui.stage("Stage 4: Plan Fix")
             plan_version += 1
+            plan_fix_out = self.feature_dir / f"plan-v{plan_version}.yaml"
             _, plan_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_plan_fix(plan_version - 1),
+                prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out),
                 config=config,
                 expected_type="plan",
                 stage=PipelineStage.PLAN_FIX.value,
+                output_path=plan_fix_out,
             )
             if not plan_validation.valid:
                 self._fail_pipeline(sm, f"Plan fix validation failed: {plan_validation.errors}")
@@ -470,12 +505,14 @@ class Dispatcher:
         self._raise_if_cancelled()
         sm.transition(PipelineStage.TASK_BREAKDOWN)
         self.tui.stage("Stage 6: Execution Slice Breakdown")
+        manifest_out = self.feature_dir / "task-manifest.yaml"
         _, validation = self._invoke_validated_agent(
             agent="planner",
-            prompt=prompt_builder.build_task_breakdown(plan_version),
+            prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out),
             config=config,
             expected_type="task_manifest",
             stage=PipelineStage.TASK_BREAKDOWN.value,
+            output_path=manifest_out,
         )
         if not validation.valid:
             self._fail_pipeline(sm, f"Task manifest validation failed: {validation.errors}")
@@ -494,12 +531,14 @@ class Dispatcher:
             self._raise_if_cancelled()
             sm.transition(PipelineStage.TASK_REVIEW)
             self.tui.stage(f"Stage 7: Execution Slice Review (iteration {iteration})")
+            task_review_out = self.feature_dir / f"task-review-v{iteration}.yaml"
             _, review_validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(),
+                prompt=prompt_builder.build_task_reviewer(task_review_out),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
+                output_path=task_review_out,
             )
             if not review_validation.valid:
                 self._fail_pipeline(sm, f"Task review validation failed: {review_validation.errors}")
@@ -520,12 +559,14 @@ class Dispatcher:
             sm.transition(PipelineStage.TASK_FIX)
             self.tui.stage(f"Stage 8: Execution Slice Fix (iteration {iteration})")
             current_manifest_version += 1
+            task_fix_out = self.feature_dir / "task-manifest.yaml"
             _, manifest_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_task_fix(iteration),
+                prompt=prompt_builder.build_task_fix(iteration, task_fix_out),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_FIX.value,
+                output_path=task_fix_out,
             )
             if not manifest_validation.valid:
                 self._fail_pipeline(sm, f"Task fix validation failed: {manifest_validation.errors}")
@@ -604,13 +645,16 @@ class Dispatcher:
         self._update_task_state(task_id, TaskState.RUNNING)
         task_path = self._move_task_artifact(task_id, "todo", "in-progress")
 
+        exec_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-execution-log.yaml"
+        exec_out.parent.mkdir(parents=True, exist_ok=True)
         _, validation = self._invoke_validated_agent(
             agent="executor",
-            prompt=prompt_builder.build_executor(task_id),
+            prompt=prompt_builder.build_executor(task_id, exec_out),
             config=config,
             expected_type="execution_result",
             stage=PipelineStage.TASK_EXECUTION.value,
             task_id=task_id,
+            output_path=exec_out,
         )
         if not validation.valid:
             self._update_task_state(task_id, TaskState.FAILED)
@@ -667,9 +711,10 @@ class Dispatcher:
 
                 sm.transition(PipelineStage.FIX_ITERATION)
                 self._update_task_state(task_id, TaskState.NEEDS_FIX)
+                fix_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
                 self._invoke_agent(
                     agent="executor",
-                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}]),
+                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out),
                     config=config,
                     stage=PipelineStage.FIX_ITERATION.value,
                     task_id=task_id,
@@ -678,13 +723,16 @@ class Dispatcher:
                 continue
 
             self.tui.stage(f"Stage 12: Reviewing {task_id} Against the Specification (iteration {iteration})")
+            review_out = self.feature_dir / "tasks" / "done" / f"{task_id}-review-v{iteration}.yaml"
+            review_out.parent.mkdir(parents=True, exist_ok=True)
             _, review_validation = self._invoke_validated_agent(
                 agent="reviewer",
-                prompt=prompt_builder.build_reviewer(task_id),
+                prompt=prompt_builder.build_reviewer(task_id, review_out),
                 config=config,
                 expected_type="review",
                 stage=PipelineStage.PER_TASK_QUALITY.value,
                 task_id=task_id,
+                output_path=review_out,
             )
             if not review_validation.valid:
                 self._update_task_state(task_id, TaskState.FAILED)
@@ -707,9 +755,10 @@ class Dispatcher:
 
             sm.transition(PipelineStage.FIX_ITERATION)
             self._update_task_state(task_id, TaskState.NEEDS_FIX)
+            fix_out2 = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
             self._invoke_agent(
                 agent="executor",
-                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", [])),
+                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2),
                 config=config,
                 stage=PipelineStage.FIX_ITERATION.value,
                 task_id=task_id,
@@ -734,12 +783,14 @@ class Dispatcher:
             self._raise_if_cancelled()
             sm.transition(PipelineStage.GAP_DETECTION)
             self.tui.stage("Stage 14: Specification-to-Code Gap Detection")
+            gap_out = self.feature_dir / f"gap-report-v{depth + 1}.yaml"
             _, validation = self._invoke_validated_agent(
                 agent="gap-detector",
-                prompt=prompt_builder.build_gap_detector(),
+                prompt=prompt_builder.build_gap_detector(gap_out),
                 config=config,
                 expected_type="gap_report",
                 stage=PipelineStage.GAP_DETECTION.value,
+                output_path=gap_out,
             )
             if not validation.valid:
                 self._fail_pipeline(sm, f"Gap report validation failed: {validation.errors}")
@@ -762,12 +813,14 @@ class Dispatcher:
 
             new_manifest_version = max(2, depth + 1)
             sm.transition(PipelineStage.TASK_BREAKDOWN)
+            gap_manifest_out = self.feature_dir / "task-manifest.yaml"
             result, task_validation = self._invoke_validated_agent(
                 agent="planner",
-                prompt=prompt_builder.build_task_breakdown(plan_version),
+                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_BREAKDOWN.value,
+                output_path=gap_manifest_out,
             )
             del result
             if not task_validation.valid:
@@ -786,12 +839,14 @@ class Dispatcher:
             self._save_task_manifest(store, merged_manifest, new_manifest_version)
 
             sm.transition(PipelineStage.TASK_REVIEW)
+            gap_review_out = self.feature_dir / f"task-review-v{new_manifest_version}.yaml"
             _, review_validation = self._invoke_validated_agent(
                 agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(),
+                prompt=prompt_builder.build_task_reviewer(gap_review_out),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
+                output_path=gap_review_out,
             )
             if not review_validation.valid:
                 self._fail_pipeline(sm, f"Gap task review validation failed: {review_validation.errors}")
@@ -816,24 +871,25 @@ class Dispatcher:
         expected_type: str,
         stage: str,
         task_id: str = "",
+        output_path: Path | None = None,
     ) -> tuple[AgentResult, ValidationResult]:
+        # Clear stale output so we only read what this invocation writes
+        if output_path and output_path.exists():
+            output_path.unlink()
+
         result = self._invoke_agent(agent, prompt, config, stage, task_id)
-        validation = self.validator.validate(result.raw_text, expected_type)
 
-        for _ in range(self.recovery.MAX_FIX_ATTEMPTS):
-            if validation.valid:
-                break
-            fix_prompt = self.recovery._build_fix_prompt(validation.errors, expected_type)
-            result = self._invoke_agent(
-                agent,
-                fix_prompt,
-                config,
-                stage,
-                task_id,
-                resume_session_id=result.session_id or None,
-            )
-            validation = self.validator.validate(result.raw_text, expected_type)
+        # Primary: read artifact from the file the agent wrote
+        raw_text = ""
+        if output_path and output_path.exists():
+            raw_text = output_path.read_text()
+        # Fallback: extract from CLI stdout (backward compat)
+        if not raw_text:
+            raw_text = result.raw_text
 
+        validation = self.validator.validate(raw_text, expected_type)
+        if not validation.valid:
+            self._report_validation_failure(agent, result, expected_type, validation)
         return result, validation
 
     def _invoke_agent(
@@ -852,11 +908,16 @@ class Dispatcher:
         if resume_session_id is None and self.registry is not None:
             resume_session_id = self.registry.get_session_for_continuation(stage, agent, task_id)
 
+        # Pre-assign session ID so it's known before the process starts
+        is_resume = resume_session_id is not None
+        session_id = resume_session_id or str(uuid.uuid4())
+
         if agent_config.get("command"):
             invocation = AgentInvocation(
                 prompt=prompt,
                 timeout=agent_config.get("timeout", 600),
-                session_id=resume_session_id,
+                session_id=session_id,
+                resume=is_resume,
                 cancel_check=self._is_cancelled,
                 command_template=agent_config["command"],
                 resume_args_template=agent_config.get("resume_args"),
@@ -870,9 +931,19 @@ class Dispatcher:
                 agent=agent,
                 model=model,
                 timeout=timeout,
-                session_id=resume_session_id,
+                session_id=session_id,
+                resume=is_resume,
                 cancel_check=self._is_cancelled,
             )
+
+        if self.debug:
+            cmd_preview = self.session.preview_cmd(invocation)
+            project_slug = str(self.project_dir).replace("/", "-")
+            cc_log = f"~/.claude/projects/{project_slug}/{session_id}.jsonl"
+            self.tui.debug(f"agent={agent} stage={stage} task={task_id or '-'} timeout={invocation.timeout}s session={session_id}")
+            self.tui.debug(f"$ {cmd_preview}")
+            self.tui.debug(f"tail -f {cc_log}")
+            invocation.debug_tailer = SessionTailer(self.project_dir, session_id)
 
         result = self.session.invoke(invocation)
         self._raise_if_cancelled()
@@ -881,12 +952,22 @@ class Dispatcher:
         self._update_status(total_cost_usd=self.total_cost_usd)
         if self.registry is not None and result.session_id:
             self.registry.register(result, agent, stage, task_id)
-        self._write_agent_log(agent, result, task_id)
+        log_path = self._write_agent_log(agent, result, task_id)
+
+        if self.debug:
+            xp_log = _home_relative(log_path) if log_path else "-"
+            self.tui.debug(
+                f"done agent={agent} "
+                f"{result.duration_ms}ms turns={result.num_turns} ${result.cost_usd:.4f} "
+                f"exit={result.exit_code} stop={result.stop_reason} output={len(result.raw_text)}ch"
+            )
+            self.tui.debug(f"xpatcher log: {xp_log}")
+
         return result
 
-    def _write_agent_log(self, agent: str, result: AgentResult, task_id: str = "") -> None:
+    def _write_agent_log(self, agent: str, result: AgentResult, task_id: str = "") -> Path | None:
         if self.feature_dir is None:
-            return
+            return None
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         task_suffix = f"-{task_id}" if task_id else ""
         path = self.feature_dir / "logs" / f"agent-{agent}{task_suffix}-{ts}.jsonl"
@@ -894,6 +975,7 @@ class Dispatcher:
         with path.open("w") as handle:
             for event in result.events:
                 handle.write(json.dumps(event) + "\n")
+        return path
 
     def _run_acceptance_checks(self, task_spec: dict) -> dict:
         failures: list[str] = []
@@ -1078,19 +1160,22 @@ class Dispatcher:
 
     def _review_task_without_command_checks(self, task_id: str, prompt_builder: PromptBuilder, store: ArtifactStore, config: dict) -> bool:
         self.tui.info(f"{task_id}: acceptance commands are missing; falling back to spec review instead of looping code fixes.")
+        existing_reviews = sorted((self.feature_dir / "tasks" / "done").glob(f"{task_id}-review-v*.yaml"))
+        version = len(existing_reviews) + 1
+        review_out = self.feature_dir / "tasks" / "done" / f"{task_id}-review-v{version}.yaml"
+        review_out.parent.mkdir(parents=True, exist_ok=True)
         _, review_validation = self._invoke_validated_agent(
             agent="reviewer",
-            prompt=prompt_builder.build_reviewer(task_id),
+            prompt=prompt_builder.build_reviewer(task_id, review_out),
             config=config,
             expected_type="review",
             stage=PipelineStage.PER_TASK_QUALITY.value,
             task_id=task_id,
+            output_path=review_out,
         )
         if not review_validation.valid:
             self._update_task_state(task_id, TaskState.FAILED)
             return False
-        existing_reviews = sorted((self.feature_dir / "tasks" / "done").glob(f"{task_id}-review-v*.yaml"))
-        version = len(existing_reviews) + 1
         store.save(f"tasks/done/{task_id}-review-v{version}.yaml", review_validation.data)
         if review_validation.data["verdict"] == "approve":
             return True
@@ -1106,6 +1191,54 @@ class Dispatcher:
     def _raise_if_cancelled(self) -> None:
         if self._is_cancelled():
             raise CancelledPipelineError("Pipeline cancelled")
+
+    def _handle_interrupt(self, sm: PipelineStateMachine, pipeline_id: str) -> None:
+        """Handle Ctrl+C: cancel pipeline, kill agent processes, switch branch, update state."""
+        self.tui.warning(f"\nInterrupted. Cleaning up pipeline {pipeline_id}...")
+        sm.transition(PipelineStage.CANCELLED)
+        self._update_status(status="cancelled", cancelled_at=_now_iso())
+        if self.feature_dir:
+            _kill_session_processes(self.feature_dir)
+        # Switch back to default branch
+        for default in ("main", "master"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", default],
+                cwd=str(self.project_dir), capture_output=True, text=True,
+            )
+            if check.returncode == 0:
+                subprocess.run(
+                    ["git", "checkout", default],
+                    cwd=str(self.project_dir), capture_output=True, text=True,
+                )
+                self.tui.status(f"Switched back to {default}")
+                break
+        self.tui.warning(f"Pipeline {pipeline_id} cancelled.")
+
+    def _report_validation_failure(
+        self,
+        agent: str,
+        result: AgentResult,
+        expected_type: str,
+        validation: ValidationResult,
+    ) -> None:
+        """Log detailed diagnostics when an agent produces invalid output."""
+        session_id = result.session_id or "(unknown)"
+        project_slug = str(self.project_dir).replace("/", "-")
+        cc_log = f"~/.claude/projects/{project_slug}/{session_id}.jsonl"
+
+        self.tui.error(f"Agent '{agent}' returned invalid output")
+        self.tui.error(f"  Expected artifact type: {expected_type}")
+        for err in validation.errors:
+            self.tui.error(f"  - {err}")
+        self.tui.error(f"  Session: {session_id}")
+        self.tui.error(f"  Duration: {result.duration_ms}ms | Turns: {result.num_turns} | Cost: ${result.cost_usd:.4f}")
+        self.tui.error(f"  Claude Code log: {cc_log}")
+
+        # Show what the agent actually produced
+        raw = result.raw_text or "(empty response)"
+        if len(raw) > 2000:
+            raw = raw[:2000] + f"\n... ({len(raw)} chars total, truncated)"
+        self.tui.error(f"  Raw output:\n{raw}")
 
     def _fail_pipeline(self, sm: PipelineStateMachine, message: str) -> None:
         self.tui.error(message)
@@ -1214,11 +1347,117 @@ def _cancel_pipeline(args, xpatcher_home):
     if record is None:
         print(f"Unknown pipeline: {args.pipeline_id}")
         return 1
-    state_file = PipelineStateFile(str(Path(record["feature_dir"]) / "pipeline-state.yaml"))
+    feature_dir = Path(record["feature_dir"])
+    state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
     sm = PipelineStateMachine(state_file)
     sm.transition(PipelineStage.CANCELLED)
     state_file.update(status="cancelled", gate_reason="", cancelled_at=_now_iso())
+
+    # Kill orphaned Claude CLI processes
+    _kill_session_processes(feature_dir)
+
     print(f"Cancelled pipeline {args.pipeline_id}")
+    return 0
+
+
+def _kill_session_processes(feature_dir: Path) -> None:
+    """Kill any Claude CLI processes associated with sessions in this pipeline."""
+    sessions_path = feature_dir / "sessions.yaml"
+    if not sessions_path.exists():
+        return
+    sessions_data = load_yaml_file(sessions_path)
+    for sid in sessions_data.get("sessions", {}):
+        try:
+            ps = subprocess.run(
+                ["pgrep", "-f", sid],
+                capture_output=True, text=True,
+            )
+            for pid_str in ps.stdout.strip().splitlines():
+                pid = int(pid_str)
+                os.kill(pid, signal.SIGTERM)
+                print(f"  Killed process {pid} (session {sid[:12]}...)")
+        except (ValueError, ProcessLookupError, OSError):
+            pass
+
+
+def _delete_pipeline(args, xpatcher_home):
+    pipeline_id = args.pipeline_id
+    record = _find_pipeline_record(xpatcher_home, pipeline_id)
+    if record is None:
+        print(f"Unknown pipeline: {pipeline_id}")
+        return 1
+
+    feature_dir = Path(record["feature_dir"])
+    project_dir = Path(record["project_dir"])
+
+    # 1. Cancel if running, and kill orphaned Claude CLI processes
+    state = load_yaml_file(feature_dir / "pipeline-state.yaml")
+    if state.get("status") == "running":
+        state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
+        state_file.update(status="cancelled")
+        print(f"  Cancelled running pipeline")
+
+    _kill_session_processes(feature_dir)
+
+    # 2. Read branch name before deleting state
+    branch_name = state.get("branch_name", "")
+
+    # 2. Remove feature directory (artifacts, logs, state)
+    if feature_dir.exists():
+        shutil.rmtree(feature_dir)
+        print(f"  Removed {feature_dir}")
+
+    # Clean up parent if empty
+    parent = feature_dir.parent
+    if parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+
+    # 3. Remove pipeline entry from index
+    for path in _iter_pipeline_indices(xpatcher_home):
+        data = _load_pipeline_index_file(path)
+        if pipeline_id in data.get("pipelines", {}):
+            del data["pipelines"][pipeline_id]
+            if data["pipelines"]:
+                _save_pipeline_index_file(path, data)
+            else:
+                path.unlink()
+                print(f"  Removed {path}")
+            break
+
+    # 4. Delete git branch from target repo
+    if branch_name and project_dir.is_dir():
+        # Switch off the branch if it's currently checked out
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(project_dir), capture_output=True, text=True,
+        )
+        if head.returncode == 0 and head.stdout.strip() == branch_name:
+            # Find default branch (main or master)
+            for default in ("main", "master"):
+                check = subprocess.run(
+                    ["git", "rev-parse", "--verify", default],
+                    cwd=str(project_dir), capture_output=True, text=True,
+                )
+                if check.returncode == 0:
+                    subprocess.run(
+                        ["git", "checkout", default],
+                        cwd=str(project_dir), capture_output=True, text=True,
+                    )
+                    print(f"  Switched to {default}")
+                    break
+
+        result = subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"  Deleted branch {branch_name}")
+        elif "not found" not in result.stderr:
+            print(f"  Branch {branch_name}: {result.stderr.strip()}")
+
+    print(f"Deleted pipeline {pipeline_id}")
     return 0
 
 
@@ -1330,9 +1569,11 @@ def main():
     start_parser.add_argument("--file", "-f", type=Path, default=None, help="Read feature description from a file (use - for stdin)")
     start_parser.add_argument("--project", type=Path, default=Path.cwd())
     start_parser.add_argument("--verbose", action="store_true")
+    start_parser.add_argument("--debug", action="store_true", help="Show detailed agent execution info (commands, session IDs, timings, output)")
 
     resume_parser = subparsers.add_parser("resume", help="Resume an interrupted pipeline")
     resume_parser.add_argument("pipeline_id")
+    resume_parser.add_argument("--debug", action="store_true", help="Show detailed agent execution info")
 
     status_parser = subparsers.add_parser("status", help="Show pipeline status")
     status_parser.add_argument("pipeline_id", nargs="?")
@@ -1346,6 +1587,9 @@ def main():
     skip_parser.add_argument("pipeline_id")
     skip_parser.add_argument("task_ids", help="Comma-separated task IDs")
     skip_parser.add_argument("--force-unblock", action="store_true")
+
+    delete_parser = subparsers.add_parser("delete", help="Delete a pipeline and all its artifacts")
+    delete_parser.add_argument("pipeline_id")
 
     subparsers.add_parser("pending", help="Show pipelines awaiting human input")
 
@@ -1367,12 +1611,12 @@ def main():
         if not description:
             print("Error: provide a description, --file, or pipe to stdin", file=sys.stderr)
             sys.exit(1)
-        Dispatcher(args.project, xpatcher_home).start(description, args.verbose)
+        Dispatcher(args.project, xpatcher_home, debug=args.debug).start(description, verbose=args.verbose, debug=args.debug)
         return
     if args.command == "resume":
         record = _find_pipeline_record(xpatcher_home, args.pipeline_id)
         project_dir = Path(record["project_dir"]) if record else Path.cwd()
-        Dispatcher(project_dir, xpatcher_home).resume(args.pipeline_id)
+        Dispatcher(project_dir, xpatcher_home, debug=args.debug).resume(args.pipeline_id)
         return
     if args.command == "status":
         _show_status(args, xpatcher_home)
@@ -1384,6 +1628,8 @@ def main():
         sys.exit(_cancel_pipeline(args, xpatcher_home))
     if args.command == "skip":
         sys.exit(_skip_tasks(args, xpatcher_home))
+    if args.command == "delete":
+        sys.exit(_delete_pipeline(args, xpatcher_home))
     if args.command == "pending":
         _show_pending(xpatcher_home)
         return

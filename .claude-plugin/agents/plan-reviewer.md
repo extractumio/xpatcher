@@ -9,6 +9,7 @@ model: opus
 maxTurns: 25
 tools:
   - Read
+  - Write
   - Glob
   - Grep
   - Bash(git log:git diff:git show:git blame:ls:wc:tree)
@@ -109,8 +110,9 @@ You do NOT see the planner's reasoning or chain of thought.
    intended behavior is missing, incomplete, or regressed.
 
 ## Output Format
-Respond with a single YAML document. Start with --- on its own line.
-Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
+Write your YAML output to the file path specified in the prompt using the Write tool.
+The file must contain a single valid YAML document starting with `---`.
+Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
 Output must conform to the `ReviewOutput` schema (Section 9 — Canonical Schema Reference).
 Severity values: `critical | major | minor | nit`.
@@ -119,7 +121,7 @@ Category values: `correctness | completeness | security | performance | style | 
 <!-- At build time, the full ReviewOutput schema is injected here from the Pydantic model. -->
 
 ## Constraints
-- You MUST NOT modify any files. You are read-only.
+- You MUST NOT modify any project files. You MAY only use Write to save the output artifact to the path specified in the prompt.
 - Be specific: reference exact file paths and line numbers when checking feasibility.
 - Verify that referenced files and functions exist — do NOT trust the planner's claims.
 - Prefer findings that strengthen the specification as an executable contract rather than stylistic rewriting.

@@ -536,6 +536,7 @@ class ArtifactValidator:
                 data["constraints"] = constraints
 
         if artifact_type in {"review", "plan_review", "task_manifest_review"}:
+            # Normalize numeric confidence → string
             confidence = data.get("confidence")
             if isinstance(confidence, (int, float)):
                 if confidence >= 0.85:
@@ -544,10 +545,95 @@ class ArtifactValidator:
                     data["confidence"] = "medium"
                 else:
                     data["confidence"] = "low"
+            # Default confidence if missing
+            if "confidence" not in data:
+                data["confidence"] = "high"
+            # Normalize verdict aliases
+            verdict = data.get("verdict", "")
+            if artifact_type in {"plan_review", "task_manifest_review"}:
+                if verdict == "approve":
+                    data["verdict"] = "approved"
+            # Normalize plan_version from plan_ref
+            if artifact_type == "plan_review" and "plan_version" not in data:
+                plan_ref = data.get("plan_ref", "")
+                import re as _re
+                m = _re.search(r"v?(\d+)", str(plan_ref))
+                data["plan_version"] = int(m.group(1)) if m else 1
+            # Normalize manifest_version
+            if artifact_type == "task_manifest_review" and "manifest_version" not in data:
+                data["manifest_version"] = 1
+            # Default file="" in findings if missing
+            for finding in data.get("findings", []):
+                if isinstance(finding, dict) and "file" not in finding:
+                    finding["file"] = ""
+
+        if artifact_type == "gap_report":
+            # Infer verdict from gaps list if missing
+            if "verdict" not in data:
+                data["verdict"] = "gaps_found" if data.get("gaps") else "complete"
+
+        if artifact_type == "docs_report":
+            # Default summary from feature/description if missing
+            if "summary" not in data:
+                data["summary"] = data.get("feature", "Documentation update completed")
+                if len(data["summary"]) < 10:
+                    data["summary"] = "Documentation update completed"
+
+        if artifact_type == "execution_result":
+            # Normalize status aliases
+            status = data.get("status", "")
+            if status == "success":
+                data["status"] = "completed"
+            # Default description="" in files_changed
+            for fc in data.get("files_changed", []):
+                if isinstance(fc, dict) and "description" not in fc:
+                    fc["description"] = ""
+            # Coerce null strings to empty
+            for key in ("upstream_branch", "upstream_head_commit", "branch_name", "branch_head_commit", "task_commit_hash"):
+                if data.get(key) is None:
+                    data[key] = ""
+
+        if artifact_type == "task_manifest":
+            # Default plan_version if missing
+            if "plan_version" not in data:
+                data["plan_version"] = 1
+            # Default summary from first task title
+            if "summary" not in data and data.get("tasks"):
+                first_title = data["tasks"][0].get("title", "Task execution")
+                data["summary"] = f"Execute: {first_title}"
+            # Auto-generate acceptance_criteria IDs if missing
+            for task in data.get("tasks", []):
+                for i, ac in enumerate(task.get("acceptance_criteria", [])):
+                    if isinstance(ac, dict) and "id" not in ac:
+                        ac["id"] = f"ac-{i + 1:02d}"
+                # Default quality_tier
+                if "quality_tier" not in task:
+                    task["quality_tier"] = "lite"
 
         if artifact_type == "plan":
+            # Normalize goal → summary
+            if "summary" not in data and "goal" in data:
+                data["summary"] = data.pop("goal")
+            # Normalize flat tasks list → single phase wrapper
+            if "phases" not in data and "tasks" in data:
+                data["phases"] = [{
+                    "id": "phase-1",
+                    "name": "Implementation",
+                    "description": data.get("summary", "Execute all tasks"),
+                    "tasks": data.pop("tasks"),
+                }]
             for phase in data.get("phases", []):
                 for task in phase.get("tasks", []):
+                    # Normalize common field name variants
+                    if "acceptance" not in task and "acceptance_criteria" in task:
+                        task["acceptance"] = task.pop("acceptance_criteria")
+                    if "estimated_complexity" not in task and "complexity" in task:
+                        task["estimated_complexity"] = task.pop("complexity")
+                    if "files" not in task and "files_to_modify" in task:
+                        files_to_modify = task.pop("files_to_modify")
+                        task["files"] = [f.get("path", f) if isinstance(f, dict) else f for f in files_to_modify]
+                    if "files" not in task and "files_in_scope" in task:
+                        task["files"] = task.pop("files_in_scope")
                     acceptance = task.get("acceptance")
                     if isinstance(acceptance, list):
                         normalized_items: list[str] = []

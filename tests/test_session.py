@@ -1,4 +1,4 @@
-"""Tests for dispatcher.session — ClaudeSession, MalformedOutputRecovery, SessionRegistry."""
+"""Tests for dispatcher.session — ClaudeSession, SessionRegistry."""
 
 import json
 import subprocess
@@ -13,7 +13,6 @@ from src.dispatcher.session import (
     AgentInvocation,
     AgentResult,
     ClaudeSession,
-    MalformedOutputRecovery,
     PreflightResult,
     SessionRegistry,
 )
@@ -74,6 +73,7 @@ class TestClaudeSessionInvoke:
             prompt="do stuff",
             agent="planner",
             session_id="sess-123",
+            resume=True,
             model="opus",
             max_turns=5,
             allowed_tools=["Read", "Bash"],
@@ -130,6 +130,7 @@ class TestClaudeSessionCommandTemplate:
             command_template=["claude", "-p", "{prompt}", "--plugin-dir", "{plugin_dir}", "--model", "opus"],
             resume_args_template=["--resume", "{session_id}"],
             session_id="sess-abc",
+            resume=True,
         )
         self.session.invoke(inv)
         cmd = mock_run.call_args[0][0]
@@ -253,9 +254,12 @@ class TestClaudeSessionPreflight:
         assert "Missing agents" in result.error
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_preflight_uses_runtime_plugin_dir_name(self, mock_run):
+    def test_preflight_ignores_plugin_dir_name_for_agent_matching(self, mock_run):
+        """Plugin dir name (e.g. '.claude-plugin') differs from agent prefix ('xpatcher:').
+        Preflight must match agents by the baked prefix, not the dir name."""
         runtime_name = ".claude-plugin"
-        agents = [agent.replace("xpatcher:", f"{runtime_name}:") for agent in ClaudeSession.REQUIRED_AGENTS]
+        # Agents are baked with xpatcher: prefix, NOT .claude-plugin:
+        agents = list(ClaudeSession.REQUIRED_AGENTS)
         events = [
             {
                 "type": "system",
@@ -276,57 +280,8 @@ class TestClaudeSessionPreflight:
         mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(events), stderr="")
         result = self.session.preflight()
         assert result.ok is True
-        assert self.session.plugin_name == runtime_name
-
-
-# ===========================================================================
-# MalformedOutputRecovery
-# ===========================================================================
-
-class TestMalformedOutputRecovery:
-    def setup_method(self):
-        self.mock_session = MagicMock(spec=ClaudeSession)
-        self.validator = ArtifactValidator()
-        self.recovery = MalformedOutputRecovery(self.mock_session, self.validator)
-
-    def test_valid_on_first_try(self):
-        valid_yaml = yaml.dump({
-            "type": "simplification",
-            "mode": "dry_run",
-        })
-        first_result = AgentResult(
-            session_id="sess-1",
-            raw_text=valid_yaml,
-        )
-        self.mock_session.invoke.return_value = first_result
-        inv = AgentInvocation(prompt="test")
-        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
-        assert validation.valid is True
-        # Should have been called only once
-        assert self.mock_session.invoke.call_count == 1
-
-    def test_retries_on_invalid_succeeds_on_retry(self):
-        invalid_result = AgentResult(session_id="sess-1", raw_text="garbage")
-        valid_yaml = yaml.dump({
-            "type": "simplification",
-            "mode": "dry_run",
-        })
-        valid_result = AgentResult(session_id="sess-1", raw_text=valid_yaml)
-
-        self.mock_session.invoke.side_effect = [invalid_result, valid_result]
-        inv = AgentInvocation(prompt="test")
-        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
-        assert validation.valid is True
-        assert self.mock_session.invoke.call_count == 2
-
-    def test_exhausts_retries_returns_invalid(self):
-        bad = AgentResult(session_id="sess-1", raw_text="garbage")
-        self.mock_session.invoke.return_value = bad
-        inv = AgentInvocation(prompt="test")
-        _, validation = self.recovery.invoke_with_validation(inv, "simplification")
-        assert validation.valid is False
-        # 1 initial + MAX_FIX_ATTEMPTS retries
-        assert self.mock_session.invoke.call_count == 1 + MalformedOutputRecovery.MAX_FIX_ATTEMPTS
+        # plugin_name stays as PLUGIN_NAME for correct agent invocation
+        assert self.session.plugin_name == ClaudeSession.PLUGIN_NAME
 
 
 # ===========================================================================

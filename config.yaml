@@ -9,6 +9,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -28,6 +30,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -47,6 +51,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -66,6 +72,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -85,6 +93,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -104,6 +114,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -123,6 +135,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -142,6 +156,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
@@ -161,6 +177,8 @@ agents:
       - json
       - "--plugin-dir"
       - "{plugin_dir}"
+      - "--agents"
+      - "{agents_json}"
       - "--permission-mode"
       - bypassPermissions
       - "--agent"
