@@ -118,11 +118,12 @@ class TestClaudeSessionInvoke:
         assert cmd[agent_idx + 1] == "xpatcher:planner"
 
 
-class TestClaudeSessionClaudeMd:
-    """CLAUDE.md injection via --append-system-prompt-file."""
+class TestClaudeSessionClaudeMdAndCommandShape:
+    """Verify CLI command includes CLAUDE.md, session-id, and correct structure."""
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_appends_claude_md_when_file_exists(self, mock_run, tmp_path):
+    def test_command_includes_claude_md_session_id_and_agent(self, mock_run, tmp_path):
+        """Single test checking multiple CLI command properties."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         claude_md = project_dir / "CLAUDE.md"
@@ -131,18 +132,33 @@ class TestClaudeSessionClaudeMd:
         session = ClaudeSession(Path("/tmp/plugin"), project_dir)
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
 
-        session.invoke(AgentInvocation(prompt="test", agent="planner"))
+        session.invoke(AgentInvocation(prompt="do work", agent="planner", session_id="sess-42"))
 
         cmd = mock_run.call_args[0][0]
+
+        # CLAUDE.md injected
         assert "--append-system-prompt-file" in cmd
         idx = cmd.index("--append-system-prompt-file")
         assert cmd[idx + 1] == str(claude_md)
 
+        # Session ID injected
+        assert "--session-id" in cmd
+        idx = cmd.index("--session-id")
+        assert cmd[idx + 1] == "sess-42"
+
+        # Agent qualified with plugin name
+        assert "--agent" in cmd
+        idx = cmd.index("--agent")
+        assert cmd[idx + 1] == "xpatcher:planner"
+
+        # Core flags present
+        assert "--bare" in cmd
+        assert "--output-format" in cmd
+
     @patch("src.dispatcher.session.subprocess.run")
-    def test_skips_claude_md_when_file_missing(self, mock_run, tmp_path):
+    def test_command_skips_claude_md_when_absent(self, mock_run, tmp_path):
         project_dir = tmp_path / "project"
         project_dir.mkdir()
-        # No CLAUDE.md created
 
         session = ClaudeSession(Path("/tmp/plugin"), project_dir)
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
@@ -153,7 +169,7 @@ class TestClaudeSessionClaudeMd:
         assert "--append-system-prompt-file" not in cmd
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_claude_md_works_with_command_template(self, mock_run, tmp_path):
+    def test_command_template_also_gets_claude_md_and_session_id(self, mock_run, tmp_path):
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         (project_dir / "CLAUDE.md").write_text("# Guide\n")
@@ -164,13 +180,23 @@ class TestClaudeSessionClaudeMd:
         inv = AgentInvocation(
             prompt="test",
             command_template=["claude", "--bare", "-p", "{prompt}"],
+            session_id="sess-99",
         )
         session.invoke(inv)
 
         cmd = mock_run.call_args[0][0]
+
+        # Template substitution worked
+        assert cmd[:3] == ["claude", "--bare", "-p"]
+        assert cmd[3] == "test"
+
+        # CLAUDE.md injected after template expansion
         assert "--append-system-prompt-file" in cmd
-        idx = cmd.index("--append-system-prompt-file")
-        assert cmd[idx + 1] == str(project_dir / "CLAUDE.md")
+        assert cmd[cmd.index("--append-system-prompt-file") + 1] == str(project_dir / "CLAUDE.md")
+
+        # Session ID injected
+        assert "--session-id" in cmd
+        assert cmd[cmd.index("--session-id") + 1] == "sess-99"
 
 
 class TestClaudeSessionCommandTemplate:

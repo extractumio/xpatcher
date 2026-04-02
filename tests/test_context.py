@@ -1,5 +1,6 @@
 """Behavioral tests for PromptBuilder."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -69,3 +70,44 @@ class TestPromptBuilder:
         assert str(builder.project_dir) in executor_prompt
         assert str(builder.feature_dir) in writer_prompt
         assert "${" not in planner_prompt + executor_prompt + writer_prompt
+
+    def test_every_prompt_contains_time_constraint_with_correct_timeout(self, tmp_path):
+        """Every build_* method injects current_time and timeout_minutes into the prompt."""
+        builder = _make_builder(tmp_path)
+        (builder.feature_dir / "intent.yaml").write_text(yaml.dump({"goal": "g"}))
+        (builder.feature_dir / "plan-v1.yaml").write_text(yaml.dump({"type": "plan"}))
+        (builder.feature_dir / "task-manifest.yaml").write_text(yaml.dump({"type": "tm"}))
+        (builder.feature_dir / "plan-review-v1.yaml").write_text(yaml.dump({"type": "pr"}))
+        (builder.feature_dir / "task-review-v1.yaml").write_text(yaml.dump({"type": "tr"}))
+        task_path = builder.feature_dir / "tasks" / "todo" / "task-001-do-stuff.yaml"
+        task_path.write_text(yaml.dump({"id": "task-001"}))
+        out = builder.feature_dir / "out.yaml"
+
+        cases = [
+            ("intent_capture",  builder.build_intent_capture("desc", out, timeout=900), 15),
+            ("planner",         builder.build_planner(out, timeout=900), 15),
+            ("plan_reviewer",   builder.build_plan_reviewer(1, out, timeout=600), 10),
+            ("plan_fix",        builder.build_plan_fix(1, out, timeout=900), 15),
+            ("task_breakdown",  builder.build_task_breakdown(1, out, timeout=900), 15),
+            ("task_reviewer",   builder.build_task_reviewer(out, timeout=600), 10),
+            ("task_fix",        builder.build_task_fix(1, out, timeout=900), 15),
+            ("executor",        builder.build_executor("task-001", out, timeout=900), 15),
+            ("executor_fix",    builder.build_executor_fix("task-001", [], out, timeout=900), 15),
+            ("tester",          builder.build_tester("task-001", out, timeout=600), 10),
+            ("reviewer",        builder.build_reviewer("task-001", out, timeout=600), 10),
+            ("gap_detector",    builder.build_gap_detector(out, timeout=600), 10),
+            ("tech_writer",     builder.build_tech_writer(out, timeout=300), 5),
+        ]
+
+        for name, prompt, expected_minutes in cases:
+            # Has a timestamp (YYYY-MM-DD HH:MM:SS)
+            assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", prompt), \
+                f"{name}: missing timestamp"
+            # Has the correct timeout in minutes
+            assert f"hard limit of {expected_minutes} minutes" in prompt, \
+                f"{name}: expected {expected_minutes} minutes, got: " + \
+                (re.search(r"hard limit of (\d+) minutes", prompt).group(0) if re.search(r"hard limit of (\d+) minutes", prompt) else "nothing")
+            # Has the output path
+            assert str(out) in prompt, f"{name}: missing output_path"
+            # No unresolved template variables
+            assert "${" not in prompt, f"{name}: unresolved template variable"
