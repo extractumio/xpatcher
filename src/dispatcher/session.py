@@ -15,7 +15,7 @@ import yaml
 
 import sys
 
-from .auth import build_subprocess_env
+from .auth import build_subprocess_env, resolve_auth_env
 from .yaml_utils import extract_yaml, load_yaml_file
 
 
@@ -39,16 +39,25 @@ class SessionTailer:
         self._session_id = session_id
         self._files: dict[Path, int] = {}  # path -> bytes read offset
         self._known_files: set[Path] = set()
+        # Snapshot existing file sizes so we only show NEW content
+        self._baseline: dict[Path, int] = {}
+        if self._watch_dir.exists():
+            for path in self._watch_dir.glob("*.jsonl"):
+                try:
+                    self._baseline[path] = path.stat().st_size
+                except OSError:
+                    pass
 
     def poll(self) -> None:
         """Check for new content in all session JSONL files."""
         if not self._watch_dir.exists():
             return
-        # Discover new JSONL files (subagents)
+        # Discover new JSONL files (subagents spawned after tailer started)
         for path in self._watch_dir.glob("*.jsonl"):
             if path not in self._known_files:
                 self._known_files.add(path)
-                self._files[path] = 0
+                # Start from current size for pre-existing files, 0 for new ones
+                self._files[path] = self._baseline.get(path, 0)
         # Read new lines from each file
         for path, offset in list(self._files.items()):
             try:
@@ -230,7 +239,9 @@ class ClaudeSession:
         self.plugin_dir = plugin_dir
         self.project_dir = project_dir
         self.plugin_name = self.PLUGIN_NAME
-        self._subprocess_env = build_subprocess_env(auth_env or {})
+        self._auth_env = auth_env or {}
+        self._xpatcher_home = plugin_dir.parent  # for re-resolving OAuth
+        self._subprocess_env = build_subprocess_env(self._auth_env)
         self._agents_json: str | None = None
         agents_path = plugin_dir / "agents.json"
         if agents_path.is_file():
@@ -423,6 +434,10 @@ class ClaudeSession:
         return cmd
 
     def _run_cmd(self, cmd: list[str], invocation: AgentInvocation) -> AgentResult:
+        # Refresh OAuth token before each invocation to avoid stale credentials
+        fresh_env = resolve_auth_env(self._xpatcher_home)
+        if fresh_env:
+            self._subprocess_env = build_subprocess_env(fresh_env)
 
         if invocation.cancel_check is None:
             proc = subprocess.run(

@@ -139,4 +139,6 @@ def _parse_access_token(raw: str) -> str | None:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None
     return data.get(_OAUTH_KEY, {}).get("accessToken") or None
