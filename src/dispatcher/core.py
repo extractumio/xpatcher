@@ -960,6 +960,14 @@ class Dispatcher:
                 exit_code=124,
                 stop_reason="timeout",
             )
+
+        # Detect OAuth token expiry — fail fast with actionable guidance
+        if result.exit_code != 0 and "Invalid API key" in result.raw_text:
+            self.tui.error("Authentication failed: OAuth access token expired during pipeline execution.")
+            self.tui.error("Fix: add a permanent API key to ~/xpatcher/.env:")
+            self.tui.error('  echo "ANTHROPIC_API_KEY=sk-ant-..." >> ~/xpatcher/.env')
+            self.tui.error("Or refresh your OAuth token by running `claude` interactively, then retry.")
+
         self._raise_if_cancelled()
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
