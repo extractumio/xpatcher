@@ -117,4 +117,4 @@ class TestDispatcherInvokeUsesConfig:
                 assert not was_resume
             else:
                 assert was_resume
-                assert _flag_value(cmd, "--resume") == dispatcher.pipeline_session_id
+                assert _flag_value(cmd, "--resume") == dispatcher._pipeline_session_id

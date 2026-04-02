@@ -194,9 +194,6 @@ iterations:
   quality_loop_max: 3
   gap_reentry_max: 2
 
-session_management:
-  abandon_threshold_pct: 90
-
 human_gates:
   spec_confirmation: false
   completion_confirmation: false

@@ -130,7 +130,7 @@ class Dispatcher:
         self.tui = TUIRenderer()
         self.total_cost_usd = 0.0
         self.state_file: PipelineStateFile | None = None
-        self.pipeline_session_id: str = ""
+        self._pipeline_session_id: str = ""
         self._pipeline_session_used: bool = False
         self.feature_dir: Path | None = None
 
@@ -210,7 +210,7 @@ class Dispatcher:
         self.feature_dir = feature_dir
         self.total_cost_usd = 0.0
         # Single session for the entire pipeline — resume after first use
-        self.pipeline_session_id = str(uuid.uuid4())
+        self._pipeline_session_id = str(uuid.uuid4())
         self._pipeline_session_used = False
 
         subprocess.run(
@@ -240,7 +240,7 @@ class Dispatcher:
         self.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
         config = self._load_config()
         self.total_cost_usd = self.state_file.read().get("total_cost_usd", 0.0)
-        self.pipeline_session_id = str(uuid.uuid4())
+        self._pipeline_session_id = str(uuid.uuid4())
         self._pipeline_session_used = False
 
         state = self.state_file.read()
@@ -906,16 +906,15 @@ class Dispatcher:
         config: dict,
         stage: str,
         task_id: str = "",
-        resume_session_id: str | None = None,
     ) -> AgentResult:
         self._raise_if_cancelled()
         agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
         agent_config = config.get("agents", {}).get(agent_key, {})
 
         # Pipeline-wide session: first call is fresh, all subsequent resume
-        if not self.pipeline_session_id:
-            self.pipeline_session_id = str(uuid.uuid4())
-        session_id = self.pipeline_session_id
+        if not self._pipeline_session_id:
+            self._pipeline_session_id = str(uuid.uuid4())
+        session_id = self._pipeline_session_id
         is_resume = self._pipeline_session_used
         if not self._pipeline_session_used:
             self._pipeline_session_used = True
@@ -964,7 +963,7 @@ class Dispatcher:
             )
 
         # Detect OAuth token expiry — fail fast with actionable guidance
-        if result.exit_code != 0 and "Invalid API key" in result.raw_text:
+        if result.exit_code != 0 and "invalid api key" in result.raw_text.lower():
             self.tui.error("Authentication failed: OAuth access token expired during pipeline execution.")
             self.tui.error("Fix: add a permanent API key to ~/xpatcher/.env:")
             self.tui.error('  echo "ANTHROPIC_API_KEY=sk-ant-..." >> ~/xpatcher/.env')
