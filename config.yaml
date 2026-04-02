@@ -18,7 +18,7 @@ agents:
       - "--model"
       - "opus[1m]"
     resume_args: ["--resume", "{session_id}"]
-    timeout: 600
+    timeout: 900
 
   plan_reviewer:
     command:
@@ -39,7 +39,7 @@ agents:
       - "--model"
       - opus
     resume_args: ["--resume", "{session_id}"]
-    timeout: 300
+    timeout: 600
 
   executor:
     command:
@@ -81,7 +81,7 @@ agents:
       - "--model"
       - opus
     resume_args: ["--resume", "{session_id}"]
-    timeout: 300
+    timeout: 600
 
   tester:
     command:
@@ -144,7 +144,7 @@ agents:
       - "--model"
       - opus
     resume_args: ["--resume", "{session_id}"]
-    timeout: 300
+    timeout: 600
 
   tech_writer:
     command:

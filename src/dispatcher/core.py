@@ -945,7 +945,15 @@ class Dispatcher:
             self.tui.debug(f"tail -f {cc_log}")
             invocation.debug_tailer = SessionTailer(self.project_dir, session_id)
 
-        result = self.session.invoke(invocation)
+        try:
+            result = self.session.invoke(invocation)
+        except subprocess.TimeoutExpired:
+            self.tui.warning(f"Agent '{agent}' timed out after {invocation.timeout}s")
+            result = AgentResult(
+                session_id=session_id,
+                exit_code=124,
+                stop_reason="timeout",
+            )
         self._raise_if_cancelled()
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
