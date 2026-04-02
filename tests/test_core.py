@@ -8,7 +8,7 @@ import yaml
 from src.artifacts.store import ArtifactStore
 from src.context.builder import PromptBuilder
 from src.dispatcher.core import CancelledPipelineError, Dispatcher, _project_pipeline_index_path, _register_pipeline_index, _skip_tasks
-from src.dispatcher.session import AgentResult, SessionRegistry
+from src.dispatcher.session import AgentResult
 from src.dispatcher.state import PipelineStateFile, PipelineStateMachine, TaskState
 
 
@@ -26,7 +26,6 @@ def _make_dispatcher(tmp_path) -> Dispatcher:
     dispatcher.feature_dir = feature_dir
     dispatcher.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
     dispatcher.state_file.write({"task_states": {}, "total_cost_usd": 0.0, "iterations": {}, "transitions": []})
-    dispatcher.registry = SessionRegistry(feature_dir / "sessions.yaml")
     return dispatcher
 
 

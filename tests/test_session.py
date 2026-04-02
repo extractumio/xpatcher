@@ -1,4 +1,4 @@
-"""Tests for dispatcher.session — ClaudeSession, SessionRegistry."""
+"""Tests for dispatcher.session — ClaudeSession."""
 
 import json
 import subprocess
@@ -14,7 +14,7 @@ from src.dispatcher.session import (
     AgentResult,
     ClaudeSession,
     PreflightResult,
-    SessionRegistry,
+
 )
 
 # ===========================================================================
@@ -365,65 +365,3 @@ class TestClaudeSessionPreflight:
         assert self.session.plugin_name == ClaudeSession.PLUGIN_NAME
 
 
-# ===========================================================================
-# SessionRegistry
-# ===========================================================================
-
-class TestSessionRegistry:
-    def test_register_and_save(self, tmp_path):
-        reg_path = tmp_path / "sessions.yaml"
-        registry = SessionRegistry(reg_path)
-
-        result = AgentResult(
-            session_id="sess-abc",
-            num_turns=3,
-            usage={"input_tokens": 1000, "output_tokens": 500},
-        )
-        sid = registry.register(result, agent_type="planner", stage="planning")
-        assert sid == "sess-abc"
-
-        # Verify file was saved
-        assert reg_path.exists()
-        data = yaml.safe_load(reg_path.read_text())
-        assert "sess-abc" in data["sessions"]
-
-    def test_get_session_for_continuation(self, tmp_path):
-        reg_path = tmp_path / "sessions.yaml"
-        registry = SessionRegistry(reg_path)
-
-        result = AgentResult(
-            session_id="sess-abc",
-            num_turns=3,
-            usage={"input_tokens": 1000, "output_tokens": 500},
-        )
-        registry.register(result, agent_type="planner", stage="planning")
-
-        sid = registry.get_session_for_continuation(
-            stage="planning", agent_type="planner"
-        )
-        assert sid == "sess-abc"
-
-    def test_get_session_none_when_no_match(self, tmp_path):
-        reg_path = tmp_path / "sessions.yaml"
-        registry = SessionRegistry(reg_path)
-        sid = registry.get_session_for_continuation(
-            stage="planning", agent_type="planner"
-        )
-        assert sid is None
-
-    def test_reload_from_disk(self, tmp_path):
-        reg_path = tmp_path / "sessions.yaml"
-        reg1 = SessionRegistry(reg_path)
-        result = AgentResult(
-            session_id="sess-xyz",
-            num_turns=1,
-            usage={"input_tokens": 100, "output_tokens": 50},
-        )
-        reg1.register(result, agent_type="executor", stage="task_execution", task_id="task-001")
-
-        # Create a new instance that loads from disk
-        reg2 = SessionRegistry(reg_path)
-        sid = reg2.get_session_for_continuation(
-            stage="task_execution", agent_type="executor", task_id="task-001"
-        )
-        assert sid == "sess-xyz"

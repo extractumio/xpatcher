@@ -139,8 +139,9 @@ class Dispatcher:
         env_has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
         label = describe_auth_source(self._auth_env, env_has_key=env_has_key)
         if label == "none":
+            env_path = self.xpatcher_home / ".env"
             self.tui.error("No authentication found. Cannot proceed.")
-            self.tui.info("  Either add ANTHROPIC_API_KEY to $XPATCHER_HOME/.env")
+            self.tui.info(f"  Either add ANTHROPIC_API_KEY to {env_path}")
             self.tui.info("  or log in interactively: run 'claude' and complete login")
             sys.exit(1)
         self.tui.success(f"Auth: {label}")
@@ -964,9 +965,10 @@ class Dispatcher:
 
         # Detect OAuth token expiry — fail fast with actionable guidance
         if result.exit_code != 0 and "invalid api key" in result.raw_text.lower():
+            env_path = self.xpatcher_home / ".env"
             self.tui.error("Authentication failed: OAuth access token expired during pipeline execution.")
-            self.tui.error("Fix: add a permanent API key to ~/xpatcher/.env:")
-            self.tui.error('  echo "ANTHROPIC_API_KEY=sk-ant-..." >> ~/xpatcher/.env')
+            self.tui.error(f"Fix: add a permanent API key to {env_path}:")
+            self.tui.error(f'  echo "ANTHROPIC_API_KEY=sk-ant-..." >> {env_path}')
             self.tui.error("Or refresh your OAuth token by running `claude` interactively, then retry.")
 
         self._raise_if_cancelled()
