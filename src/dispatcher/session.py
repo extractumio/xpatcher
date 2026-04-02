@@ -385,6 +385,11 @@ class ClaudeSession:
         if invocation.session_id and "--resume" not in cmd and "--session-id" not in cmd:
             cmd.extend(["--session-id", invocation.session_id])
 
+        # Inject project CLAUDE.md as system prompt context (--bare skips auto-discovery)
+        claude_md = self.project_dir / "CLAUDE.md"
+        if claude_md.is_file() and "--append-system-prompt-file" not in cmd:
+            cmd.extend(["--append-system-prompt-file", str(claude_md)])
+
         return self._run_cmd(cmd, invocation)
 
     def _build_cmd_from_template(self, invocation: AgentInvocation) -> list[str]:
