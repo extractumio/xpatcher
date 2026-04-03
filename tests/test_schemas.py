@@ -100,6 +100,14 @@ class TestSchemaContracts:
         assert result.valid is False
         assert "must include at least one must_pass command-based acceptance criterion" in result.errors[0]
 
+    def test_task_manifest_rejects_malformed_python_c_command(self):
+        data = _task_manifest_data()
+        data["tasks"][0]["acceptance_criteria"][0]["command"] = "python -c \"for\""
+        validator = ArtifactValidator()
+        result = validator.validate_data(data, expected_type="task_manifest")
+        assert result.valid is False
+        assert "invalid python -c program" in result.errors[0]
+
     def test_task_manifest_rejects_empty_task_list(self):
         data = _task_manifest_data()
         data["tasks"] = []
@@ -170,6 +178,30 @@ class TestValidatorRouting:
         )
         assert result.valid is True
         assert result.data["confidence"] == "high"
+
+    def test_validator_normalizes_blank_review_finding_category(self):
+        validator = ArtifactValidator()
+        result = validator.validate_data(
+            {
+                "type": "plan_review",
+                "plan_version": 1,
+                "verdict": "needs_changes",
+                "confidence": "high",
+                "summary": "The plan needs minor structural cleanup before approval",
+                "findings": [
+                    {
+                        "id": "f-1",
+                        "severity": "",
+                        "category": "",
+                        "description": "Missing package initialization detail for discovered modules",
+                    }
+                ],
+            },
+            expected_type="plan_review",
+        )
+        assert result.valid is True
+        assert result.data["findings"][0]["severity"] == "minor"
+        assert result.data["findings"][0]["category"] == "completeness"
 
     def test_validator_normalizes_mixed_plan_acceptance_items(self):
         validator = ArtifactValidator()

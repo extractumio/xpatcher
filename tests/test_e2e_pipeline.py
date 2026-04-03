@@ -1,6 +1,7 @@
 """Integration-style pipeline tests with mocked Claude CLI responses."""
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -52,6 +53,19 @@ def _result(text: str, session_id: str) -> AgentResult:
     return AgentResult(session_id=session_id, raw_text=text, cost_usd=0.1, events=[{"type": "result"}], usage={"input_tokens": 1, "output_tokens": 1})
 
 
+def _invoke_and_write_artifact(responses):
+    def _invoke(invocation):
+        result = next(responses)
+        match = re.search(r"Write .* to: (.+)", invocation.prompt)
+        if match:
+            path = Path(match.group(1).strip())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(result.raw_text)
+        return result
+
+    return _invoke
+
+
 def test_full_pipeline_completes_and_moves_task_artifacts(tmp_path, monkeypatch):
     project_dir = _make_repo(tmp_path)
     home = _make_home(tmp_path)
@@ -100,7 +114,7 @@ def test_full_pipeline_completes_and_moves_task_artifacts(tmp_path, monkeypatch)
             ),
         ]
     )
-    monkeypatch.setattr(dispatcher.session, "invoke", lambda invocation: next(responses))
+    monkeypatch.setattr(dispatcher.session, "invoke", _invoke_and_write_artifact(responses))
 
     dispatcher.start("Add a farewell helper with tests")
 
@@ -140,7 +154,7 @@ def test_gap_reentry_creates_new_manifest_and_gap_task(tmp_path, monkeypatch):
             _result("---\ntype: docs_report\nsummary: Updated docs report artifact\n", "a9"),
         ]
     )
-    monkeypatch.setattr(dispatcher.session, "invoke", lambda invocation: next(responses))
+    monkeypatch.setattr(dispatcher.session, "invoke", _invoke_and_write_artifact(responses))
 
     dispatcher.start("Add a farewell helper with tests")
 

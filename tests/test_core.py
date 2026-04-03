@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -9,7 +10,7 @@ from src.artifacts.store import ArtifactStore
 from src.context.builder import PromptBuilder
 from src.dispatcher.core import CancelledPipelineError, Dispatcher, _project_pipeline_index_path, _register_pipeline_index, _skip_tasks
 from src.dispatcher.session import AgentResult
-from src.dispatcher.state import PipelineStateFile, PipelineStateMachine, TaskState
+from src.dispatcher.state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskState
 
 
 def _make_dispatcher(tmp_path) -> Dispatcher:
@@ -165,6 +166,11 @@ class TestDispatcherPersistence:
 
         assert state["total_cost_usd"] == 1.25
         assert log_files
+
+    def test_expired_oauth_only_warns_before_invoke(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        with patch("src.dispatcher.auth.check_oauth_expiry", return_value={"expired": True, "minutes_remaining": -1, "needs_refresh": True}):
+            dispatcher._check_oauth_before_invoke()
 
 
 class TestResumeHumanGate:
@@ -366,6 +372,37 @@ class TestAcceptanceChecks:
         assert "command failed" in report["regression_failures"][0]
         assert report["verification_summary"]["missing_commands"] == 1
 
+    def test_shell_command_runs_via_bash(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        marker = dispatcher.project_dir / "marker.txt"
+        task["acceptance_criteria"][0]["command"] = f"python -c \"print('ok')\" > {marker.name}"
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "pass"
+        assert marker.read_text().strip() == "ok"
+
+    def test_bash_process_substitution_runs_when_bash_is_available(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        task["acceptance_criteria"][0]["command"] = "diff <(printf 'ok\\n') <(printf 'ok\\n')"
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "pass"
+
+    def test_invalid_python_c_is_reported_as_spec_failure(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        task["acceptance_criteria"][0]["command"] = "python -c \"for\""
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "fail"
+        assert "invalid python -c program" in report["regression_failures"][0]
+        assert dispatcher._only_verification_spec_failures(report) is True
+
 
 class TestGapReentryBlocked:
     def test_gap_reentry_transitions_to_blocked_when_execution_fails(self, tmp_path, monkeypatch):
@@ -413,6 +450,70 @@ class TestGapReentryBlocked:
         assert result is False
         assert state["current_stage"] == "blocked"
         assert state.get("gate_reason") == "gap_execution_failed"
+
+    def test_gap_reentry_uses_next_manifest_version_after_existing_history(self, tmp_path, monkeypatch):
+        dispatcher = _make_dispatcher(tmp_path)
+        store = ArtifactStore(dispatcher.feature_dir)
+        manifest = _manifest()
+        dispatcher._save_task_manifest(store, manifest, manifest_version=3)
+        (dispatcher.feature_dir / "plan-v1.yaml").write_text(
+            yaml.dump({"type": "plan", "summary": "Plan summary", "phases": [], "risks": []})
+        )
+        dispatcher.state_file.write({
+            "current_stage": "task_execution",
+            "status": "running",
+            "task_states": {},
+            "iterations": {},
+            "transitions": [],
+            "total_cost_usd": 0.0,
+        })
+
+        gap_report_data = {"type": "gap_report", "verdict": "gaps_found", "gaps": [{"id": "G-1", "severity": "major", "category": "integration", "description": "Gap"}]}
+        task_manifest_data = {
+            "type": "task_manifest",
+            "plan_version": 1,
+            "summary": "Gap manifest",
+            "tasks": manifest["tasks"] + [{
+                "id": "task-G001",
+                "title": "Gap task",
+                "description": "Close the gap with follow-up work",
+                "files_in_scope": [],
+                "acceptance_criteria": [
+                    {"id": "ac-gap", "description": "Gap check passes", "verification": "command", "command": "python -c \"print('ok')\"", "severity": "must_pass"},
+                ],
+                "depends_on": [],
+                "estimated_complexity": "low",
+                "quality_tier": "lite",
+            }],
+        }
+        review_data = {"type": "task_manifest_review", "manifest_version": 4, "verdict": "approved", "confidence": "high", "summary": "OK"}
+        complete_gap_data = {"type": "gap_report", "verdict": "complete", "gaps": []}
+
+        responses = iter([
+            (AgentResult(), type("V", (), {"valid": True, "data": gap_report_data})()),
+            (AgentResult(), type("V", (), {"valid": True, "data": task_manifest_data})()),
+            (AgentResult(), type("V", (), {"valid": True, "data": review_data})()),
+            (AgentResult(), type("V", (), {"valid": True, "data": complete_gap_data})()),
+        ])
+        monkeypatch.setattr(dispatcher, "_invoke_validated_stage", lambda *args, **kwargs: next(responses))
+        def fake_run_prioritization_and_execution(sm, *args, **kwargs):
+            sm.transition(PipelineStage.PRIORITIZATION)
+            sm.transition(PipelineStage.EXECUTION_GRAPH)
+            sm.transition(PipelineStage.TASK_EXECUTION)
+            return True
+
+        monkeypatch.setattr(dispatcher, "_run_prioritization_and_execution", fake_run_prioritization_and_execution)
+
+        sm = PipelineStateMachine(dispatcher.state_file)
+        result = dispatcher._run_gap_detection_with_reentry(
+            sm, store, PromptBuilder(dispatcher.feature_dir, dispatcher.project_dir),
+            {"iterations": {"gap_reentry_max": 2}, "pipeline": {"mode": "v2"}}, plan_version=1,
+        )
+
+        assert result is True
+        assert (dispatcher.feature_dir / "task-manifest-v4.yaml").exists()
+        assert (dispatcher.feature_dir / "task-manifest-v3.yaml").exists()
+        assert (dispatcher.feature_dir / "task-review-v4.yaml").exists()
 
 
 class TestPipelineIndex:

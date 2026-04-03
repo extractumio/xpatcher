@@ -74,7 +74,7 @@ templates:
 
     If the specification describes a single cohesive change, produce a manifest with ONE task. Only decompose when genuinely needed.
 
-    Each task must have: id (task-NNN format), title, description, files_in_scope (plain path strings), acceptance_criteria with executable command checks, depends_on, estimated_complexity (low|medium|high), quality_tier (lite|standard|thorough).
+    Each task must have: id (task-NNN or task-GNNN format), title, description, files_in_scope (plain path strings), acceptance_criteria with executable command checks, depends_on, estimated_complexity (low|medium|high), quality_tier (lite|standard|thorough).
 
     Hard requirements for acceptance_criteria:
     - Every task must include at least one item with severity: must_pass

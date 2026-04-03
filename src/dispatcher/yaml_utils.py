@@ -1,8 +1,14 @@
 """Shared YAML utilities for agent output parsing and file I/O."""
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 import yaml
+
+
+def now_iso() -> str:
+    """Return current UTC time as ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def load_yaml_file(path: Path) -> dict:
@@ -11,6 +17,12 @@ def load_yaml_file(path: Path) -> dict:
         return yaml.safe_load(path.read_text()) or {}
     except (FileNotFoundError, OSError):
         return {}
+
+
+def save_yaml_file(path: Path, data: dict) -> None:
+    """Write a dict as YAML to a file, creating parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
 
 
 def extract_yaml(text: str) -> dict | None:

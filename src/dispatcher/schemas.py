@@ -11,6 +11,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from .command_validation import lint_acceptance_command
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -514,6 +515,12 @@ class ArtifactValidator:
                     errors.append(
                         f"Task {task.get('id', '<unknown>')} criterion {criterion.get('id', '<unknown>')} is missing its executable command"
                     )
+                    continue
+                command_error = lint_acceptance_command(command)
+                if command_error:
+                    errors.append(
+                        f"Task {task.get('id', '<unknown>')} criterion {criterion.get('id', '<unknown>')} has an invalid command: {command_error}"
+                    )
 
         return errors
 
@@ -626,6 +633,8 @@ class ArtifactValidator:
                 sev = finding.get("severity", "")
                 if isinstance(sev, str):
                     finding["severity"] = _FINDING_SEV_ALIASES.get(sev.lower(), sev.lower())
+                if not finding.get("severity"):
+                    finding["severity"] = "minor"
                 # category aliases
                 _FINDING_CAT_ALIASES = {"bug": "correctness", "logic": "correctness",
                                         "correct": "correctness",
@@ -643,6 +652,8 @@ class ArtifactValidator:
                 cat = finding.get("category", "")
                 if isinstance(cat, str):
                     finding["category"] = _FINDING_CAT_ALIASES.get(cat.lower(), cat.lower())
+                if not finding.get("category"):
+                    finding["category"] = "correctness" if artifact_type == "review" else "completeness"
 
             # Verdict aliases
             verdict = data.get("verdict", "")
@@ -793,7 +804,12 @@ class ArtifactValidator:
                         f.get("path", str(f)) if isinstance(f, dict) else str(f)
                         for f in fis
                     ]
-                # Defaults
+                # Defaults and aliases
+                _QT_ALIASES = {"production": "thorough", "full": "thorough",
+                               "basic": "lite", "minimal": "lite", "default": "standard"}
+                qt = task.get("quality_tier", "lite")
+                if isinstance(qt, str):
+                    task["quality_tier"] = _QT_ALIASES.get(qt.lower(), qt.lower())
                 task.setdefault("quality_tier", "lite")
                 task.setdefault("rationale", "")
                 task.setdefault("files_in_scope", [])

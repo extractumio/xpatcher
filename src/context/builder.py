@@ -1,5 +1,8 @@
 """Prompt assembly per agent and pipeline stage."""
 
+from __future__ import annotations
+
+import re
 from datetime import datetime
 from pathlib import Path
 from string import Template
@@ -11,14 +14,30 @@ class MissingArtifactError(Exception):
     pass
 
 
+# Regex to strip v1 delegation preambles when using direct --agent
+_DELEGATION_RE = re.compile(
+    r"^Delegate this task to @agent-\S+ — do NOT do this work yourself.*?subagent\.\s*\n*",
+    re.MULTILINE,
+)
+_TASK_FOR_RE = re.compile(
+    r"^Task for the \S+:\s*",
+    re.MULTILINE,
+)
+
+
 class PromptBuilder:
-    """Builds prompts for each agent invocation."""
+    """Builds prompts for each agent invocation.
+
+    In v2 mode with direct --agent, delegation text is stripped
+    since the prompt goes directly to the target agent.
+    """
 
     _templates: dict[str, str] | None = None
 
-    def __init__(self, feature_dir: Path, project_dir: Path):
+    def __init__(self, feature_dir: Path, project_dir: Path, v2_mode: bool = False):
         self.feature_dir = feature_dir
         self.project_dir = project_dir
+        self.v2_mode = v2_mode
 
     @classmethod
     def _load_templates(cls) -> dict[str, str]:
@@ -40,7 +59,15 @@ class PromptBuilder:
         }
         for key, value in values.items():
             payload[key] = self._escape(value)
-        return Template(template).substitute(payload)
+        rendered = Template(template).substitute(payload)
+
+        # v2: strip delegation preamble when using direct --agent
+        if self.v2_mode:
+            rendered = _DELEGATION_RE.sub("", rendered)
+            rendered = _TASK_FOR_RE.sub("", rendered)
+            rendered = rendered.lstrip("\n")
+
+        return rendered
 
     @staticmethod
     def _escape(value) -> str:

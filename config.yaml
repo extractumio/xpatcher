@@ -10,3 +10,36 @@ iterations:
 human_gates:
   spec_confirmation: false
   completion_confirmation: false
+
+# v2 feature flags — enable incrementally
+pipeline:
+  mode: v2
+
+sessions:
+  use_lanes: true
+
+context:
+  use_bootstrap_artifacts: true
+
+contracts:
+  generated: true
+
+reviews:
+  severity_gate: true
+
+gaps:
+  delta_mode: true
+
+# v2 validation retry policy
+validation:
+  max_retries: 2
+  rotate_on_retry: true
+  persist_failures: true
+
+# v2 budget caps (USD, 0 = no cap)
+budgets:
+  pipeline: 0
+  spec_author: 0
+  manifest_author: 0
+  task_exec: 0
+  gap_analysis: 0

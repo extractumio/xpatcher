@@ -9,9 +9,10 @@ Resolution order
 ----------------
 1. ``ANTHROPIC_API_KEY`` from ``$XPATCHER_HOME/.env``
 2. ``ANTHROPIC_API_KEY`` already present in the inherited environment
-3. OAuth access token extracted from the local Claude Code credential
-   store (macOS Keychain or ``~/.claude/.credentials.json``) — passed
-   as ``ANTHROPIC_API_KEY`` (the Anthropic API routes by token prefix)
+3. Native Claude OAuth credentials from the local Claude Code credential
+   store (macOS Keychain or ``~/.claude/.credentials.json``). In this
+   case xpatcher does not inject ``ANTHROPIC_API_KEY`` and lets the
+   Claude CLI manage refresh and keychain access directly.
 """
 
 import json
@@ -42,9 +43,8 @@ def resolve_auth_env(xpatcher_home: Path) -> dict[str, str]:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return {}
 
-    token = _extract_oauth_access_token()
-    if token:
-        return {"ANTHROPIC_API_KEY": token}
+    if has_oauth_credentials():
+        return {}
 
     return {}
 
@@ -76,7 +76,15 @@ def describe_auth_source(auth_env: dict[str, str], env_has_key: bool = False) ->
         return _SOURCE_DOTENV
     if env_has_key:
         return _SOURCE_ENV
+    if has_oauth_credentials():
+        return _SOURCE_OAUTH
     return "none"
+
+
+def has_oauth_credentials() -> bool:
+    """Return True when Claude OAuth credentials exist locally."""
+    raw = _load_oauth_raw()
+    return isinstance(raw, dict) and bool(raw.get("accessToken") or raw.get("refreshToken"))
 
 
 def _load_api_key_from_dotenv(xpatcher_home: Path) -> str | None:

@@ -33,12 +33,14 @@ class SessionTailer:
     and prints compact summaries of tool calls and text output to stderr.
     """
 
-    def __init__(self, project_dir: Path, session_id: str):
+    def __init__(self, project_dir: Path, session_id: str, emit_debug: bool = True):
         slug = str(project_dir).replace("/", "-")
         self._watch_dir = Path.home() / ".claude" / "projects" / slug
         self._session_id = session_id
+        self._emit_debug = emit_debug
         self._files: dict[Path, int] = {}  # path -> bytes read offset
         self._known_files: set[Path] = set()
+        self._agent_labels: dict[Path, str] = {}
         # Snapshot existing file sizes so we only show NEW content
         self._baseline: dict[Path, int] = {}
         if self._watch_dir.exists():
@@ -48,10 +50,11 @@ class SessionTailer:
                 except OSError:
                     pass
 
-    def poll(self) -> None:
+    def poll(self) -> list["TailerActivity"]:
         """Check for new content in all session JSONL files."""
+        activities: list[TailerActivity] = []
         if not self._watch_dir.exists():
-            return
+            return activities
         # Discover new JSONL files (subagents spawned after tailer started)
         for path in self._watch_dir.glob("*.jsonl"):
             if path not in self._known_files:
@@ -69,15 +72,18 @@ class SessionTailer:
                     new_data = f.read()
                     self._files[path] = f.tell()
                 for line in new_data.splitlines():
-                    self._print_event(line, path)
+                    activity = self._print_event(line, path)
+                    if activity:
+                        activities.append(activity)
             except (OSError, ValueError):
                 pass
+        return activities
 
-    def _print_event(self, line: str, path: Path) -> None:
+    def _print_event(self, line: str, path: Path) -> "TailerActivity | None":
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            return
+            return None
         etype = event.get("type")
         # Show the session file stem only if it's a subagent (not main session)
         prefix = ""
@@ -93,35 +99,50 @@ class SessionTailer:
                     name = block.get("name", "?")
                     inp = block.get("input", {})
                     detail = self._tool_summary(name, inp)
-                    self._emit(f"{prefix}{name}: {detail}")
+                    if self._emit_debug:
+                        self._emit(f"{prefix}{name}: {detail}")
+                    return TailerActivity(actor=self._actor_for_path(path), summary=detail)
                 elif bt == "text":
                     text = block.get("text", "").strip()
                     if text:
-                        # Show first line only, truncated
-                        first = text.split("\n")[0][:120]
-                        self._emit(f"{prefix}{first}")
+                        if self._emit_debug:
+                            first = text.split("\n")[0][:120]
+                            self._emit(f"{prefix}{first}")
         elif etype == "agent-setting":
             agent = event.get("agentSetting", "")
             if agent:
-                self._emit(f"{prefix}agent: {agent}")
+                self._agent_labels[path] = agent
+                if self._emit_debug:
+                    self._emit(f"{prefix}agent: {agent}")
+        return None
+
+    def _actor_for_path(self, path: Path) -> str:
+        return self._agent_labels.get(path) or ("main-agent" if path.stem == self._session_id else f"agent-{path.stem[:8]}")
 
     @staticmethod
     def _tool_summary(name: str, inp: dict) -> str:
         if name in ("Read", "read"):
-            return inp.get("file_path", "?")
+            return f"reading {inp.get('file_path', '?')}"
         if name in ("Write", "write"):
-            return inp.get("file_path", "?")
+            return f"writing {inp.get('file_path', '?')}"
         if name in ("Edit", "edit"):
-            return inp.get("file_path", "?")
+            return f"editing {inp.get('file_path', '?')}"
         if name in ("Bash", "bash"):
             cmd = inp.get("command", "?")
-            return cmd[:100] + ("..." if len(cmd) > 100 else "")
+            shortened = cmd[:100] + ("..." if len(cmd) > 100 else "")
+            return f"running {shortened}"
         if name in ("Glob", "glob"):
-            return inp.get("pattern", "?")
+            return f"scanning {inp.get('pattern', '?')}"
         if name in ("Grep", "grep"):
-            return f'/{inp.get("pattern", "?")}/  {inp.get("path", "")}'
+            pattern = inp.get("pattern", "?")
+            path = inp.get("path", "")
+            return f"searching /{pattern}/ {path}".strip()
         if name == "Agent":
-            return inp.get("description", inp.get("prompt", "?"))[:80]
+            agent = inp.get("agent", "") or inp.get("name", "")
+            detail = inp.get("description", inp.get("prompt", "?"))[:80]
+            if agent:
+                return f"delegating to {agent}: {detail}"
+            return f"delegating: {detail}"
         return str(inp)[:80]
 
     @staticmethod
@@ -161,6 +182,11 @@ class AgentInvocation:
     resume: bool = False
     cancel_check: Optional[Callable[[], bool]] = None
     debug_tailer: Optional[SessionTailer] = None
+    # v2 fields
+    agent: Optional[str] = None  # --agent for direct invocation
+    max_budget_usd: Optional[float] = None  # --max-budget-usd
+    lane_name: Optional[str] = None  # lane for telemetry
+    status_callback: Optional[Callable[[list["TailerActivity"]], None]] = None
 
 
 @dataclass
@@ -176,6 +202,12 @@ class AgentResult:
     stop_reason: str = ""
     usage: Optional[dict] = None
     events: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class TailerActivity:
+    actor: str
+    summary: str
 
 
 @dataclass
@@ -348,6 +380,8 @@ class ClaudeSession:
         Without ``--bare``, Claude Code natively discovers CLAUDE.md,
         plugin agents, skills, and hooks from ``--plugin-dir``.  The
         main agent delegates to subagents via the Agent tool.
+
+        v2 additions: --agent for direct invocation, --max-budget-usd.
         """
         cmd = [
             "claude", "-p", invocation.prompt,
@@ -359,6 +393,12 @@ class ClaudeSession:
             cmd.extend(["--resume", invocation.session_id])
         if invocation.max_turns:
             cmd.extend(["--max-turns", str(invocation.max_turns)])
+        # v2: direct agent invocation
+        if invocation.agent:
+            cmd.extend(["--agent", invocation.agent])
+        # v2: per-invocation budget cap
+        if invocation.max_budget_usd is not None and invocation.max_budget_usd > 0:
+            cmd.extend(["--max-budget-usd", str(invocation.max_budget_usd)])
         return cmd
 
     def _run_cmd(self, cmd: list[str], invocation: AgentInvocation) -> AgentResult:
@@ -413,7 +453,11 @@ class ClaudeSession:
                             self._terminate_process(proc)
                             raise subprocess.TimeoutExpired(cmd, invocation.timeout)
                         if invocation.debug_tailer:
-                            invocation.debug_tailer.poll()
+                            activities = invocation.debug_tailer.poll()
+                            if invocation.status_callback is not None:
+                                invocation.status_callback(activities)
+                        elif invocation.status_callback is not None:
+                            invocation.status_callback([])
                         time.sleep(0.25)
                 except KeyboardInterrupt:
                     self._terminate_process(proc)

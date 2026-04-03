@@ -11,6 +11,7 @@ from src.dispatcher.auth import (
     resolve_auth_env,
     build_subprocess_env,
     describe_auth_source,
+    has_oauth_credentials,
 )
 
 
@@ -87,20 +88,17 @@ class TestEnvironmentResolution:
 # ---------------------------------------------------------------------------
 
 class TestOAuthResolution:
-    def test_extracts_oauth_token(self, tmp_path):
+    def test_uses_native_oauth_without_injecting_api_key(self, tmp_path):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ANTHROPIC_API_KEY", None)
-            with patch(
-                "src.dispatcher.auth._extract_oauth_access_token",
-                return_value="sk-ant-oat01-testtoken",
-            ):
+            with patch("src.dispatcher.auth.has_oauth_credentials", return_value=True):
                 result = resolve_auth_env(tmp_path)
-        assert result == {"ANTHROPIC_API_KEY": "sk-ant-oat01-testtoken"}
+        assert result == {}
 
     def test_no_oauth_returns_empty(self, tmp_path):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ANTHROPIC_API_KEY", None)
-            with patch("src.dispatcher.auth._extract_oauth_access_token", return_value=None):
+            with patch("src.dispatcher.auth.has_oauth_credentials", return_value=False):
                 result = resolve_auth_env(tmp_path)
         assert result == {}
 
@@ -131,11 +129,16 @@ class TestDescribeAuthSource:
     def test_oauth_token(self):
         assert describe_auth_source({"ANTHROPIC_API_KEY": "sk-ant-oat01-x"}) == "Claude subscription (OAuth)"
 
+    def test_native_oauth_without_env_override(self):
+        with patch("src.dispatcher.auth.has_oauth_credentials", return_value=True):
+            assert describe_auth_source({}) == "Claude subscription (OAuth)"
+
     def test_from_environment(self):
         assert describe_auth_source({}, env_has_key=True) == "API key (environment)"
 
     def test_none(self):
-        assert describe_auth_source({}) == "none"
+        with patch("src.dispatcher.auth.has_oauth_credentials", return_value=False):
+            assert describe_auth_source({}) == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +146,20 @@ class TestDescribeAuthSource:
 # ---------------------------------------------------------------------------
 
 class TestCredentialParsing:
+    def test_has_oauth_credentials_from_credentials_file(self, tmp_path):
+        cred = {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-abc123",
+                "refreshToken": "sk-ant-ort01-def456",
+            }
+        }
+        with patch("src.dispatcher.auth.platform") as mock_platform:
+            mock_platform.system.return_value = "Linux"
+            with patch("src.dispatcher.auth.Path.home", return_value=tmp_path):
+                (tmp_path / ".claude").mkdir()
+                (tmp_path / ".claude" / ".credentials.json").write_text(json.dumps(cred))
+                assert has_oauth_credentials() is True
+
     def test_parses_keychain_json(self, tmp_path):
         cred = {
             "claudeAiOauth": {

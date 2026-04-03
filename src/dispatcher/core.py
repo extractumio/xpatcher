@@ -16,17 +16,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .auth import resolve_auth_env, describe_auth_source
+from .command_validation import prepare_acceptance_command
 from .state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
 from .session import AgentInvocation, AgentResult, ClaudeSession, SessionTailer
 from .schemas import ArtifactValidator, ValidationResult
+from .lanes import LaneManager
+from .budget import BudgetManager
 from .tui import TUIRenderer
 from .yaml_utils import load_yaml_file
 from ..artifacts.store import ArtifactStore
 from ..context.builder import PromptBuilder
+from ..context.packets import ContextManager
+from ..context.contracts import build_contract_block
 
 
 class CancelledPipelineError(RuntimeError):
     """Raised when a pipeline is cancelled while a dispatcher is running."""
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised when a configured budget cap prevents further execution."""
 
 
 def generate_pipeline_id() -> str:
@@ -133,6 +142,10 @@ class Dispatcher:
         self._pipeline_session_id: str = ""
         self._pipeline_session_used: bool = False
         self.feature_dir: Path | None = None
+        # v2 components (initialized per-pipeline)
+        self.lanes: LaneManager | None = None
+        self.budget: BudgetManager | None = None
+        self.context_mgr: ContextManager | None = None
 
     def _require_auth(self):
         """Show auth source and abort if no credentials were resolved."""
@@ -204,15 +217,25 @@ class Dispatcher:
 
         sm = PipelineStateMachine(state_file)
         store = ArtifactStore(feature_dir)
-        prompt_builder = PromptBuilder(feature_dir, self.project_dir)
         config = self._load_config()
+        prompt_builder = PromptBuilder(feature_dir, self.project_dir, v2_mode=self._is_v2(config))
 
         self.state_file = state_file
         self.feature_dir = feature_dir
         self.total_cost_usd = 0.0
-        # Single session for the entire pipeline — resume after first use
+        # v1 fallback: single session for the entire pipeline
         self._pipeline_session_id = str(uuid.uuid4())
         self._pipeline_session_used = False
+        self.lanes = None
+        self.budget = None
+        self.context_mgr = None
+        # v2: lane-scoped sessions, budget, context
+        if self._is_v2(config):
+            if self._use_lanes(config):
+                self.lanes = LaneManager(feature_dir, config)
+            self.budget = BudgetManager(config)
+            if self._use_bootstrap_artifacts(config):
+                self.context_mgr = ContextManager(feature_dir, self.project_dir)
 
         subprocess.run(
             ["git", "checkout", "-b", branch_name],
@@ -220,9 +243,13 @@ class Dispatcher:
             capture_output=True,
         )
 
+        self.tui.configure_live_dashboard(self._use_live_dashboard(config))
+        self.tui.set_pipeline(pipeline_id, description)
         self.tui.header(f"Pipeline {pipeline_id}: {description}")
         try:
             self._run_pipeline(sm, store, prompt_builder, config, description, verbose, debug)
+        except BudgetExceededError as exc:
+            self._handle_budget_exhausted(sm, str(exc))
         except CancelledPipelineError:
             self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
         except KeyboardInterrupt:
@@ -253,14 +280,28 @@ class Dispatcher:
         self.feature_dir = feature_dir
         self.state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
         config = self._load_config()
-        self.total_cost_usd = self.state_file.read().get("total_cost_usd", 0.0)
+        state = self.state_file.read()
+        self.total_cost_usd = state.get("total_cost_usd", 0.0)
         self._pipeline_session_id = str(uuid.uuid4())
         self._pipeline_session_used = False
         self.debug = debug
+        self.lanes = None
+        self.budget = None
+        self.context_mgr = None
+        # v2 components for resume
+        if self._is_v2(config):
+            if self._use_lanes(config):
+                self.lanes = LaneManager(feature_dir, config)
+            self.budget = BudgetManager(config)
+            self._restore_v2_state(state)
+            if self._use_bootstrap_artifacts(config):
+                self.context_mgr = ContextManager(feature_dir, self.project_dir)
 
-        state = self.state_file.read()
         current = PipelineStage(state.get("current_stage", PipelineStage.UNINITIALIZED.value))
         gate_reason = state.get("gate_reason", "")
+        self.tui.configure_live_dashboard(self._use_live_dashboard(config))
+        self.tui.set_pipeline(pipeline_id, state.get("description", ""))
+        self.tui.set_stage(current.value)
         self.tui.header(f"Resuming {pipeline_id}")
         self._require_auth()
 
@@ -273,7 +314,7 @@ class Dispatcher:
             if gate_reason == "plan_approval" and current in {PipelineStage.PAUSED, PipelineStage.PLAN_APPROVAL}:
                 sm = PipelineStateMachine(self.state_file)
                 store = ArtifactStore(feature_dir)
-                prompt_builder = PromptBuilder(feature_dir, self.project_dir)
+                prompt_builder = PromptBuilder(feature_dir, self.project_dir, v2_mode=self._is_v2(config))
                 approved = self._handle_plan_approval(sm, store, prompt_builder, config, transition_stage=False)
                 if not approved:
                     return
@@ -293,7 +334,7 @@ class Dispatcher:
                 if not self._run_gap_detection_with_reentry(sm, store, prompt_builder, config, plan_version):
                     return
                 sm.transition(PipelineStage.DOCUMENTATION)
-                self.tui.stage("Stage 15: Documentation")
+                self.tui.stage("Stage 15: Documentation", stage_key=PipelineStage.DOCUMENTATION.value)
                 docs_out = self.feature_dir / "docs-report.yaml"
                 _, validation = self._invoke_validated_stage(
                     prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
@@ -314,11 +355,13 @@ class Dispatcher:
                 self._handle_completion_gate(PipelineStateMachine(self.state_file), ArtifactStore(feature_dir), transition_stage=False)
                 return
 
-            self.tui.info(
-                "Resume supports paused human gates and --from-stage for stage-level recovery.\n"
-                f"  Available stages: {', '.join(self._RESUMABLE_STAGES)}\n"
-                "  Example: xpatcher resume <id> --from-stage plan_review"
-            )
+                self.tui.info(
+                    "Resume supports paused human gates and --from-stage for stage-level recovery.\n"
+                    f"  Available stages: {', '.join(self._RESUMABLE_STAGES)}\n"
+                    "  Example: xpatcher resume <id> --from-stage plan_review"
+                )
+        except BudgetExceededError as exc:
+            self._handle_budget_exhausted(PipelineStateMachine(self.state_file), str(exc))
         except CancelledPipelineError:
             self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
         except KeyboardInterrupt:
@@ -335,7 +378,7 @@ class Dispatcher:
         target = PipelineStage(from_stage)
         sm = PipelineStateMachine(self.state_file)
         store = ArtifactStore(feature_dir)
-        prompt_builder = PromptBuilder(feature_dir, self.project_dir)
+        prompt_builder = PromptBuilder(feature_dir, self.project_dir, v2_mode=self._is_v2(config))
         description = state.get("description", "")
 
         # Validate required artifacts exist for the target stage
@@ -364,7 +407,7 @@ class Dispatcher:
 
         elif target == PipelineStage.PLANNING:
             sm.transition(PipelineStage.PLANNING)
-            self.tui.stage("Stage 2: Planning")
+            self.tui.stage("Stage 2: Planning", stage_key=PipelineStage.PLANNING.value)
             next_version = plan_version + 1
             plan_path = self.feature_dir / f"plan-v{next_version}.yaml"
             _, validation = self._invoke_validated_stage(
@@ -414,7 +457,7 @@ class Dispatcher:
 
         elif target == PipelineStage.DOCUMENTATION:
             sm.transition(PipelineStage.DOCUMENTATION)
-            self.tui.stage("Stage 15: Documentation")
+            self.tui.stage("Stage 15: Documentation", stage_key=PipelineStage.DOCUMENTATION.value)
             docs_out = self.feature_dir / "docs-report.yaml"
             _, validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
@@ -454,7 +497,7 @@ class Dispatcher:
         if not self._run_gap_detection_with_reentry(sm, store, prompt_builder, config, plan_version):
             return
         sm.transition(PipelineStage.DOCUMENTATION)
-        self.tui.stage("Stage 15: Documentation")
+        self.tui.stage("Stage 15: Documentation", stage_key=PipelineStage.DOCUMENTATION.value)
         docs_out = self.feature_dir / "docs-report.yaml"
         _, validation = self._invoke_validated_stage(
             prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
@@ -496,6 +539,85 @@ class Dispatcher:
             missing.append("task-manifest.yaml")
         return missing
 
+    def _is_v2(self, config: dict | None = None) -> bool:
+        """Check if v2 mode is enabled."""
+        if config is None:
+            config = self._load_config()
+        return config.get("pipeline", {}).get("mode", "v1") == "v2"
+
+    def _has_severity_gate(self, config: dict) -> bool:
+        """Check if severity-gated review is enabled."""
+        return config.get("reviews", {}).get("severity_gate", False) and self._is_v2(config)
+
+    def _has_delta_gaps(self, config: dict) -> bool:
+        """Check if delta-based gap handling is enabled."""
+        return config.get("gaps", {}).get("delta_mode", False) and self._is_v2(config)
+
+    def _use_lanes(self, config: dict) -> bool:
+        return self._is_v2(config) and config.get("sessions", {}).get("use_lanes", True)
+
+    def _use_bootstrap_artifacts(self, config: dict) -> bool:
+        return self._is_v2(config) and config.get("context", {}).get("use_bootstrap_artifacts", True)
+
+    def _use_generated_contracts(self, config: dict) -> bool:
+        return self._is_v2(config) and config.get("contracts", {}).get("generated", True)
+
+    def _persist_validation_failures(self, config: dict) -> bool:
+        return config.get("validation", {}).get("persist_failures", True)
+
+    def _use_live_dashboard(self, config: dict) -> bool:
+        return config.get("ui", {}).get("live_dashboard", True) and not self.debug
+
+    def _review_severity_allows_continue(self, review_data: dict) -> bool:
+        """Check if review findings are minor-only (auto-approve)."""
+        if review_data.get("verdict") == "approved":
+            return True
+        findings = review_data.get("findings", [])
+        if not findings:
+            return False
+        severities = {f.get("severity", "critical") for f in findings}
+        # If only minor and nit findings, auto-approve
+        return severities <= {"minor", "nit"}
+
+    def _restore_v2_state(self, state: dict) -> None:
+        if self.budget:
+            persisted_costs = state.get("budget_costs")
+            if not isinstance(persisted_costs, dict):
+                legacy_costs = state.get("budget_checkpoints")
+                persisted_costs = legacy_costs if isinstance(legacy_costs, dict) else {}
+            self.budget.load_costs(persisted_costs)
+
+    def _budget_scopes_for(self, stage: str, task_id: str = "") -> list[str]:
+        scopes: list[str] = []
+        if self.lanes:
+            scopes.append(self.lanes.lane_for_stage(stage, task_id))
+        if self.budget:
+            scopes.append("pipeline")
+        return scopes
+
+    def _remaining_budget_usd(self, stage: str, task_id: str = "") -> float | None:
+        if not self.budget:
+            return None
+        remaining_values = []
+        for scope in self._budget_scopes_for(stage, task_id):
+            remaining = self.budget.remaining(scope)
+            if remaining is not None:
+                remaining_values.append((scope, remaining))
+        if not remaining_values:
+            return None
+        min_scope, min_remaining = min(remaining_values, key=lambda item: item[1])
+        if min_remaining <= 0:
+            raise BudgetExceededError(f"Budget exhausted for {min_scope}")
+        return min_remaining
+
+    def _max_retries_for(self, stage: str, task_id: str, default: int) -> int:
+        if not self.budget:
+            return default
+        allowed = default
+        for scope in self._budget_scopes_for(stage, task_id):
+            allowed = min(allowed, self.budget.max_retries(scope, default=default))
+        return allowed
+
     def _run_pipeline(
         self,
         sm: PipelineStateMachine,
@@ -510,9 +632,15 @@ class Dispatcher:
         self.debug = debug
         self._raise_if_cancelled()
 
+        # v2: bootstrap context before any agent invocation
+        if self.context_mgr and self._is_v2(config):
+            self.tui.stage("Bootstrap: Building project context artifacts")
+            self.context_mgr.build_bootstrap_context(description)
+            self.tui.success("Context artifacts created")
+
         sm.transition(PipelineStage.INTENT_CAPTURE)
         self._update_status(status="running")
-        self.tui.stage("Stage 1: Intent Capture")
+        self.tui.stage("Stage 1: Intent Capture", stage_key=PipelineStage.INTENT_CAPTURE.value)
         intent_path = self.feature_dir / "intent.yaml"
         _, validation = self._invoke_validated_stage(
             prompt=prompt_builder.build_intent_capture(description, intent_path, self._stage_timeout(config)),
@@ -526,8 +654,12 @@ class Dispatcher:
             return
         store.save("intent.yaml", validation.data)
 
+        # v2: update feature brief with structured intent data
+        if self.context_mgr and self._is_v2(config):
+            self.context_mgr.build_feature_brief(description, validation.data)
+
         sm.transition(PipelineStage.PLANNING)
-        self.tui.stage("Stage 2: Planning")
+        self.tui.stage("Stage 2: Planning", stage_key=PipelineStage.PLANNING.value)
         plan_v1_path = self.feature_dir / "plan-v1.yaml"
         _, validation = self._invoke_validated_stage(
             prompt=prompt_builder.build_planner(plan_v1_path, self._stage_timeout(config)),
@@ -548,6 +680,11 @@ class Dispatcher:
         if not self._handle_plan_approval(sm, store, prompt_builder, config, plan_version=plan_version):
             return
 
+        # v2: build plan and manifest context packets
+        if self.context_mgr and self._is_v2(config):
+            self.context_mgr.build_plan_packet(plan_version)
+            self.context_mgr.build_manifest_packet(plan_version)
+
         manifest_version = self._run_task_breakdown_and_review(
             sm,
             store,
@@ -566,7 +703,7 @@ class Dispatcher:
             return
 
         sm.transition(PipelineStage.DOCUMENTATION)
-        self.tui.stage("Stage 15: Documentation")
+        self.tui.stage("Stage 15: Documentation", stage_key=PipelineStage.DOCUMENTATION.value)
         docs_out = self.feature_dir / "docs-report.yaml"
         _, validation = self._invoke_validated_stage(
             prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
@@ -597,7 +734,7 @@ class Dispatcher:
         for iteration in range(1, max_iterations + 1):
             self._raise_if_cancelled()
             sm.transition(PipelineStage.PLAN_REVIEW)
-            self.tui.stage(f"Stage 3: Plan Review (iteration {iteration})")
+            self.tui.stage(f"Stage 3: Plan Review (iteration {iteration})", stage_key=PipelineStage.PLAN_REVIEW.value)
             review_out = self.feature_dir / f"plan-review-v{plan_version}.yaml"
             _, validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_plan_reviewer(plan_version, review_out, self._stage_timeout(config)),
@@ -616,6 +753,11 @@ class Dispatcher:
             if validation.data["verdict"] == "approved":
                 return plan_version
 
+            # v2: severity-gated auto-approve for minor-only findings
+            if self._has_severity_gate(config) and self._review_severity_allows_continue(validation.data):
+                self.tui.info("Plan review: minor-only findings — auto-approved with warnings recorded.")
+                return plan_version
+
             if iteration >= max_iterations:
                 sm.transition(PipelineStage.BLOCKED)
                 self._update_status(status="waiting_for_human", gate_reason="plan_review_limit")
@@ -623,7 +765,7 @@ class Dispatcher:
                 return None
 
             sm.transition(PipelineStage.PLAN_FIX)
-            self.tui.stage("Stage 4: Plan Fix")
+            self.tui.stage("Stage 4: Plan Fix", stage_key=PipelineStage.PLAN_FIX.value)
             plan_version += 1
             plan_fix_out = self.feature_dir / f"plan-v{plan_version}.yaml"
             _, plan_validation = self._invoke_validated_stage(
@@ -658,7 +800,7 @@ class Dispatcher:
             sm.transition(PipelineStage.PLAN_APPROVAL)
         requires_human = self._requires_plan_confirmation(config)
         if not requires_human:
-            self.tui.stage("Stage 5: Specification Freeze")
+            self.tui.stage("Stage 5: Specification Freeze", stage_key=PipelineStage.PLAN_APPROVAL.value)
             self.tui.info("Specification auto-approved; continuing without a human gate.")
             self._update_status(status="running", gate_reason="")
             store.save_decision("plan-approval", {"approved": True, "auto_approved": True, "plan_version": plan_version})
@@ -691,7 +833,7 @@ class Dispatcher:
         del gap_round
         self._raise_if_cancelled()
         sm.transition(PipelineStage.TASK_BREAKDOWN)
-        self.tui.stage("Stage 6: Execution Slice Breakdown")
+        self.tui.stage("Stage 6: Execution Slice Breakdown", stage_key=PipelineStage.TASK_BREAKDOWN.value)
         manifest_out = self.feature_dir / "task-manifest.yaml"
         _, validation = self._invoke_validated_stage(
             prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out, self._stage_timeout(config)),
@@ -716,7 +858,7 @@ class Dispatcher:
         for iteration in range(1, max_iterations + 1):
             self._raise_if_cancelled()
             sm.transition(PipelineStage.TASK_REVIEW)
-            self.tui.stage(f"Stage 7: Execution Slice Review (iteration {iteration})")
+            self.tui.stage(f"Stage 7: Execution Slice Review (iteration {iteration})", stage_key=PipelineStage.TASK_REVIEW.value)
             task_review_out = self.feature_dir / f"task-review-v{iteration}.yaml"
             _, review_validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_task_reviewer(task_review_out, self._stage_timeout(config)),
@@ -735,6 +877,11 @@ class Dispatcher:
             if review_validation.data["verdict"] == "approved":
                 return current_manifest_version
 
+            # v2: severity-gated auto-approve for minor-only findings
+            if self._has_severity_gate(config) and self._review_severity_allows_continue(review_validation.data):
+                self.tui.info("Task review: minor-only findings — auto-approved with warnings recorded.")
+                return current_manifest_version
+
             if iteration >= max_iterations:
                 sm.transition(PipelineStage.BLOCKED)
                 self._update_status(status="waiting_for_human", gate_reason="task_review_limit")
@@ -742,7 +889,7 @@ class Dispatcher:
                 return None
 
             sm.transition(PipelineStage.TASK_FIX)
-            self.tui.stage(f"Stage 8: Execution Slice Fix (iteration {iteration})")
+            self.tui.stage(f"Stage 8: Execution Slice Fix (iteration {iteration})", stage_key=PipelineStage.TASK_FIX.value)
             current_manifest_version += 1
             task_fix_out = self.feature_dir / "task-manifest.yaml"
             _, manifest_validation = self._invoke_validated_stage(
@@ -769,7 +916,7 @@ class Dispatcher:
         overall_success = True
         self._raise_if_cancelled()
         sm.transition(PipelineStage.PRIORITIZATION)
-        self.tui.stage("Stage 9: Spec-Derived Prioritization")
+        self.tui.stage("Stage 9: Spec-Derived Prioritization", stage_key=PipelineStage.PRIORITIZATION.value)
 
         manifest = store.load("task-manifest.yaml")
         tasks = manifest.get("tasks", [])
@@ -787,7 +934,7 @@ class Dispatcher:
         store.save("execution-plan.yaml", {"order": execution_order, "dag": dag.to_dict()})
 
         sm.transition(PipelineStage.EXECUTION_GRAPH)
-        self.tui.stage("Stage 10: Execution Graph")
+        self.tui.stage("Stage 10: Execution Graph", stage_key=PipelineStage.EXECUTION_GRAPH.value)
 
         sm.transition(PipelineStage.TASK_EXECUTION)
         for task_id in execution_order:
@@ -825,7 +972,7 @@ class Dispatcher:
         task_id: str,
     ) -> bool:
         self._raise_if_cancelled()
-        self.tui.stage(f"Stage 11: Executing {task_id}")
+        self.tui.stage(f"Stage 11: Executing {task_id}", stage_key=PipelineStage.TASK_EXECUTION.value, task_id=task_id)
         self._update_task_state(task_id, TaskState.RUNNING)
         task_path = self._move_task_artifact(task_id, "todo", "in-progress")
 
@@ -904,7 +1051,7 @@ class Dispatcher:
                 sm.transition(PipelineStage.PER_TASK_QUALITY)
                 continue
 
-            self.tui.stage(f"Stage 12: Reviewing {task_id} Against the Specification (iteration {iteration})")
+            self.tui.stage(f"Stage 12: Reviewing {task_id} Against the Specification (iteration {iteration})", stage_key=PipelineStage.PER_TASK_QUALITY.value, task_id=task_id)
             review_out = self.feature_dir / "tasks" / "done" / f"{task_id}-review-v{iteration}.yaml"
             review_out.parent.mkdir(parents=True, exist_ok=True)
             _, review_validation = self._invoke_validated_stage(
@@ -962,7 +1109,7 @@ class Dispatcher:
         while True:
             self._raise_if_cancelled()
             sm.transition(PipelineStage.GAP_DETECTION)
-            self.tui.stage("Stage 14: Specification-to-Code Gap Detection")
+            self.tui.stage("Stage 14: Specification-to-Code Gap Detection", stage_key=PipelineStage.GAP_DETECTION.value)
             gap_out = self.feature_dir / f"gap-report-v{depth + 1}.yaml"
             _, validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_gap_detector(gap_out, self._stage_timeout(config)),
@@ -987,14 +1134,30 @@ class Dispatcher:
                 self.tui.warning("Gap re-entry limit reached; pipeline blocked for human intervention.")
                 return False
 
+            # v2: build gap packet for delta-based gap closure
+            if self.context_mgr and self._has_delta_gaps(config):
+                self.context_mgr.build_gap_packet(validation.data, depth)
+
             manifest = store.load("task-manifest.yaml")
             existing_ids = {task["id"] for task in manifest.get("tasks", [])}
 
-            new_manifest_version = max(2, depth + 1)
+            new_manifest_version = max(2, store.latest_version("task-manifest") + 1)
             sm.transition(PipelineStage.TASK_BREAKDOWN)
             gap_manifest_out = self.feature_dir / "task-manifest.yaml"
+
+            # v2 delta mode: prompt specifically asks for delta tasks only
+            if self._has_delta_gaps(config):
+                gap_prompt = self._build_gap_delta_prompt(
+                    prompt_builder, plan_version, gap_manifest_out,
+                    validation.data, existing_ids, config,
+                )
+            else:
+                gap_prompt = prompt_builder.build_task_breakdown(
+                    plan_version, gap_manifest_out, self._stage_timeout(config),
+                )
+
             result, task_validation = self._invoke_validated_stage(
-                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out, self._stage_timeout(config)),
+                prompt=gap_prompt,
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_BREAKDOWN.value,
@@ -1011,6 +1174,12 @@ class Dispatcher:
                 self._update_status(status="waiting_for_human", gate_reason="gap_tasks_empty")
                 self.tui.warning("Gap detector reported missing work, but no new tasks were materialized.")
                 return False
+
+            # v2: save delta manifest separately for lineage
+            if self._has_delta_gaps(config):
+                delta_manifest = {"type": "task_manifest_delta", "gap_version": depth,
+                                  "tasks": gap_tasks, "source_gap_report": f"gap-report-v{depth}.yaml"}
+                store.save(f"task-manifest-delta-v{depth}.yaml", delta_manifest)
 
             merged_manifest = dict(manifest)
             merged_manifest["tasks"] = manifest.get("tasks", []) + gap_tasks
@@ -1029,16 +1198,52 @@ class Dispatcher:
                 self._fail_pipeline(sm, f"Gap task review validation failed: {review_validation.errors}")
                 return False
             store.save(f"task-review-v{new_manifest_version}.yaml", review_validation.data)
+
+            # v2: severity-gated gap review
             if review_validation.data["verdict"] != "approved":
-                sm.transition(PipelineStage.BLOCKED)
-                self._update_status(status="waiting_for_human", gate_reason="gap_task_review")
-                return False
+                if self._has_severity_gate(config) and self._review_severity_allows_continue(review_validation.data):
+                    self.tui.info("Gap task review: minor-only findings — auto-approved.")
+                else:
+                    sm.transition(PipelineStage.BLOCKED)
+                    self._update_status(status="waiting_for_human", gate_reason="gap_task_review")
+                    return False
 
             if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
                 sm.transition(PipelineStage.BLOCKED)
                 self._update_status(status="waiting_for_human", gate_reason="gap_execution_failed")
                 self.tui.warning("Gap re-entry tasks failed; pipeline blocked for human intervention.")
                 return False
+
+    def _build_gap_delta_prompt(
+        self,
+        prompt_builder: PromptBuilder,
+        plan_version: int,
+        output_path: Path,
+        gap_report: dict,
+        existing_ids: set[str],
+        config: dict,
+    ) -> str:
+        """Build a prompt for delta-only gap closure task breakdown."""
+        import yaml
+        gap_summary = yaml.dump(gap_report.get("gaps", []), default_flow_style=False)
+        existing_list = ", ".join(sorted(existing_ids))
+        timeout = self._stage_timeout(config)
+        timeout_min = max(1, timeout // 60)
+
+        return (
+            f"Create ONLY new tasks to close the gaps found in the gap report. "
+            f"Do NOT regenerate existing tasks.\n\n"
+            f"Gap findings:\n{gap_summary}\n"
+            f"Existing task IDs (do not duplicate): {existing_list}\n\n"
+            f"Plan: {self.feature_dir}/plan-v{plan_version}.yaml\n"
+            f"Project: {self.project_dir}\n\n"
+            f"Each new task must have: id (task-NNN or task-GNNN format, unique), title, description, "
+            f"files_in_scope, acceptance_criteria with must_pass command checks, "
+            f"depends_on, estimated_complexity, quality_tier.\n\n"
+            f"Time constraint: hard limit of {timeout_min} minutes.\n"
+            f"Write the delta task manifest as YAML to: {output_path}\n"
+            f"The file must start with --- and contain only valid YAML conforming to TaskManifestOutput schema."
+        )
 
     def _stage_timeout(self, config: dict) -> int:
         """Return the configured timeout (seconds) for stage invocations."""
@@ -1053,36 +1258,168 @@ class Dispatcher:
         task_id: str = "",
         output_path: Path | None = None,
     ) -> tuple[AgentResult, ValidationResult]:
-        # Clear stale output so we only read what this invocation writes
-        if output_path and output_path.exists():
-            output_path.unlink()
+        """Invoke a stage with validation and bounded retry (v2 repair loop).
 
-        result = self._invoke_stage(prompt, config, stage, task_id)
+        Retry strategy:
+        1. First attempt: normal invocation
+        2. If invalid: retry in same lane session with repair prompt
+        3. If still invalid: rotate lane session, retry with same contract
+        4. Fail after bounded retries
+        """
+        self._remaining_budget_usd(stage, task_id)
+        max_retries = config.get("validation", {}).get("max_retries", 2)
+        rotate_on_retry = config.get("validation", {}).get("rotate_on_retry", True)
 
-        # Primary: read artifact from the file the agent wrote
-        raw_text = ""
-        if output_path and output_path.exists():
-            raw_text = output_path.read_text()
-        # Fallback: extract from CLI stdout (backward compat)
-        if not raw_text:
-            raw_text = result.raw_text
+        # Budget-aware retry tightening
+        if self.budget:
+            max_retries = self._max_retries_for(stage, task_id, max_retries)
 
-        validation = self.validator.validate(raw_text, expected_type)
-        if not validation.valid:
+        last_result = None
+        last_validation = None
+
+        for attempt in range(1 + max_retries):
+            # Clear stale output so we only read what this invocation writes
+            if output_path and output_path.exists():
+                output_path.unlink()
+
+            # First attempt uses original prompt; retries use repair prompt
+            if attempt == 0:
+                invoke_prompt = prompt
+            else:
+                invoke_prompt = self._build_repair_prompt(
+                    prompt, expected_type, last_validation, output_path, config
+                )
+
+            # On second retry, rotate lane session if configured
+            if attempt >= 2 and rotate_on_retry and self.lanes:
+                self.lanes.rotate_lane(stage, task_id)
+                self.tui.info(f"Rotated lane session for {stage} (retry {attempt})")
+
+            result = self._invoke_stage(invoke_prompt, config, stage, task_id)
+            invocation_error = self._nonrecoverable_invocation_error(result)
+
+            if invocation_error:
+                validation = ValidationResult(valid=False, errors=[invocation_error])
+            elif output_path is not None:
+                if not output_path.exists():
+                    validation = ValidationResult(
+                        valid=False,
+                        errors=[f"Expected YAML artifact file at {output_path}, but the agent did not write it"],
+                    )
+                else:
+                    raw_text = output_path.read_text()
+                    if not raw_text.strip():
+                        validation = ValidationResult(
+                            valid=False,
+                            errors=[f"Expected YAML artifact file at {output_path}, but it was empty"],
+                        )
+                    else:
+                        validation = self.validator.validate(raw_text, expected_type)
+            else:
+                validation = self.validator.validate(result.raw_text, expected_type)
+            last_result = result
+            last_validation = validation
+
+            if validation.valid:
+                if attempt > 0:
+                    self.tui.success(f"Validation repair succeeded on attempt {attempt + 1}")
+                return result, validation
+
+            # Persist validation failure snapshot
+            if self._persist_validation_failures(config):
+                self._record_validation_failure(stage, result, expected_type, validation, attempt)
             self._report_validation_failure(stage, result, expected_type, validation)
-        return result, validation
+
+            if invocation_error:
+                self.tui.error(f"Stopping {stage} without retry because the failure is non-recoverable.")
+                break
+
+            if attempt < max_retries:
+                self.tui.warning(f"Validation failed for {stage} (attempt {attempt + 1}/{1 + max_retries}), retrying...")
+
+        return last_result, last_validation
+
+    def _nonrecoverable_invocation_error(self, result: AgentResult) -> str | None:
+        """Return an error string when retrying this invocation would be wasteful."""
+        if result.exit_code == 0:
+            return None
+        raw = (result.raw_text or "").lower()
+        if "invalid api key" in raw or "authentication failed" in raw:
+            return "Non-recoverable agent invocation failure: authentication was rejected"
+        return None
+
+    def _build_repair_prompt(
+        self,
+        original_prompt: str,
+        expected_type: str,
+        validation: ValidationResult | None,
+        output_path: Path | None,
+        config: dict | None = None,
+    ) -> str:
+        """Build a targeted repair prompt from validation errors."""
+        errors = validation.errors if validation else ["Unknown validation error"]
+        error_text = "\n".join(f"  - {e}" for e in errors[:5])
+
+        # Try to get contract block for the expected type
+        contract_hint = ""
+        if config is None or self._use_generated_contracts(config):
+            from .schemas import SCHEMAS
+            schema_class = SCHEMAS.get(expected_type)
+            if schema_class:
+                try:
+                    contract_hint = f"\n\nExpected output contract:\n{build_contract_block(schema_class, expected_type)}"
+                except Exception:
+                    pass
+
+        output_instruction = f"\nWrite the corrected YAML to: {output_path}" if output_path else ""
+        original_block = f"\n\nOriginal task instructions:\n{original_prompt}" if original_prompt else ""
+
+        return (
+            f"The previous output failed validation for type '{expected_type}'. "
+            f"Fix the following errors and rewrite the complete YAML artifact:\n\n"
+            f"Validation errors:\n{error_text}\n"
+            f"{contract_hint}\n"
+            f"{original_block}\n"
+            f"IMPORTANT: Output ONLY valid YAML starting with ---. No prose.{output_instruction}"
+        )
+
+    def _record_validation_failure(
+        self,
+        stage: str,
+        result: AgentResult,
+        expected_type: str,
+        validation: ValidationResult,
+        attempt: int,
+    ) -> None:
+        """Persist validation failure snapshot for debugging."""
+        if not self.feature_dir:
+            return
+        from .yaml_utils import save_yaml_file
+        failures_dir = self.feature_dir / "validation-failures"
+        snapshot = {
+            "stage": stage,
+            "expected_type": expected_type,
+            "attempt": attempt + 1,
+            "errors": validation.errors,
+            "timestamp": _now_iso(),
+            "session_id": result.session_id,
+            "duration_ms": result.duration_ms,
+            "cost_usd": result.cost_usd,
+        }
+        save_yaml_file(failures_dir / f"{stage}-attempt-{attempt + 1}.yaml", snapshot)
+        raw_path = failures_dir / f"{stage}-attempt-{attempt + 1}-raw.txt"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(result.raw_text or "(empty)")
 
     def _check_oauth_before_invoke(self):
-        """Check OAuth token expiry before invoking an agent. Fail fast with guidance."""
+        """Check OAuth token expiry before invoking an agent."""
         from .auth import check_oauth_expiry
         status = check_oauth_expiry(self.xpatcher_home)
         if status is None:
             return  # Not using OAuth
         if status["expired"]:
-            self.tui.error("OAuth access token has expired.")
-            self.tui.error("Refresh by running: claude auth login")
-            self.tui.error("Then retry: xpatcher resume <pipeline-id> --from-stage <stage>")
-            raise RuntimeError("OAuth token expired")
+            self.tui.warning("Stored OAuth access token is expired; allowing Claude CLI to refresh native auth if available.")
+            return
         if status["needs_refresh"]:
             self.tui.warning(f"OAuth token expires in {status['minutes_remaining']}m — consider refreshing soon.")
 
@@ -1096,13 +1433,27 @@ class Dispatcher:
         self._raise_if_cancelled()
         self._check_oauth_before_invoke()
 
-        # Pipeline-wide session: first call is fresh, all subsequent resume
-        if not self._pipeline_session_id:
-            self._pipeline_session_id = str(uuid.uuid4())
-        session_id = self._pipeline_session_id
-        is_resume = self._pipeline_session_used
-        if not self._pipeline_session_used:
-            self._pipeline_session_used = True
+        # v2: lane-scoped sessions (resolve_session internally calls lane_for_stage)
+        if self.lanes:
+            lane_name = self.lanes.lane_for_stage(stage, task_id)
+            agent_name = self.lanes.agent_for_lane(lane_name)
+        else:
+            # v1 fallback: pipeline-wide session
+            if not self._pipeline_session_id:
+                self._pipeline_session_id = str(uuid.uuid4())
+            session_id = self._pipeline_session_id
+            is_resume = self._pipeline_session_used
+            if not self._pipeline_session_used:
+                self._pipeline_session_used = True
+            lane_name = ""
+            agent_name = None
+
+        # v2: direct agent invocation for deterministic stages
+        use_direct_agent = self._is_v2(config) and agent_name
+        # v2: per-invocation budget
+        budget_usd = self._remaining_budget_usd(stage, task_id)
+        if self.lanes:
+            session_id, is_resume = self.lanes.resolve_session(stage, task_id)
 
         timeout = self._stage_timeout(config)
         invocation = AgentInvocation(
@@ -1111,16 +1462,33 @@ class Dispatcher:
             session_id=session_id,
             resume=is_resume,
             cancel_check=self._is_cancelled,
+            agent=agent_name if use_direct_agent else None,
+            max_budget_usd=budget_usd,
+            lane_name=lane_name,
         )
+        self.tui.set_invocation_context(lane=lane_name, owner_agent=agent_name or "", task_id=task_id)
+
+        def _status_callback(activities):
+            if activities:
+                latest = activities[-1]
+                self.tui.update_activity(latest.actor, latest.summary)
+            else:
+                self.tui.update_activity()
+
+        invocation.status_callback = _status_callback
 
         if self.debug:
             cmd_preview = self.session.preview_cmd(invocation)
             project_slug = str(self.project_dir).replace("/", "-")
             cc_log = f"~/.claude/projects/{project_slug}/{session_id}.jsonl"
-            self.tui.debug(f"stage={stage} task={task_id or '-'} timeout={invocation.timeout}s session={session_id}")
+            lane_info = f" lane={lane_name}" if lane_name else ""
+            agent_info = f" agent={agent_name}" if use_direct_agent else ""
+            self.tui.debug(f"stage={stage} task={task_id or '-'}{lane_info}{agent_info} timeout={invocation.timeout}s session={session_id}")
             self.tui.debug(f"$ {cmd_preview}")
             self.tui.debug(f"tail -f {cc_log}")
-            invocation.debug_tailer = SessionTailer(self.project_dir, session_id)
+            invocation.debug_tailer = SessionTailer(self.project_dir, session_id, emit_debug=True)
+        elif self._use_live_dashboard(config):
+            invocation.debug_tailer = SessionTailer(self.project_dir, session_id, emit_debug=False)
 
         try:
             result = self.session.invoke(invocation)
@@ -1131,19 +1499,31 @@ class Dispatcher:
                 exit_code=124,
                 stop_reason="timeout",
             )
+        finally:
+            self.tui.clear_activity()
 
         # Detect OAuth token expiry — fail fast with actionable guidance
         if result.exit_code != 0 and "invalid api key" in result.raw_text.lower():
             env_path = self.xpatcher_home / ".env"
-            self.tui.error("Authentication failed: OAuth access token expired during pipeline execution.")
+            self.tui.error("Authentication failed: Claude rejected the current credentials.")
             self.tui.error(f"Fix: add a permanent API key to {env_path}:")
             self.tui.error(f'  echo "ANTHROPIC_API_KEY=sk-ant-..." >> {env_path}')
-            self.tui.error("Or refresh your OAuth token by running `claude` interactively, then retry.")
+            self.tui.error("Or refresh native Claude auth by running `claude auth login`, then retry.")
 
         self._raise_if_cancelled()
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
         self._update_status(total_cost_usd=self.total_cost_usd)
+        # v2: record cost to lane and budget, persist at checkpoint
+        if self.lanes and lane_name:
+            self.lanes.record_cost(stage, task_id, result.cost_usd)
+        if self.budget and lane_name:
+            self.budget.record_cost(lane_name, result.cost_usd)
+            for scope in dict.fromkeys([lane_name, "pipeline"]):
+                cp = self.budget.check(scope)
+                if cp.warning:
+                    self.tui.warning(cp.warning)
+        self._persist_v2_state()
         log_path = self._write_agent_log(stage, result, task_id)
 
         # Show agent's final message with colored stripe
@@ -1189,10 +1569,19 @@ class Dispatcher:
             if not command:
                 missing_commands += 1
                 continue
+            parsed_command, parse_error = self._parse_acceptance_command(command)
+            if parse_error:
+                checks.append({
+                    "name": criterion.get("id", command),
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "error_message": parse_error,
+                })
+                failures.append(f"{criterion.get('id', 'unknown')}: {parse_error}")
+                continue
             proc = subprocess.run(
-                command,
+                parsed_command,
                 cwd=str(self.project_dir),
-                shell=True,
                 capture_output=True,
                 text=True,
             )
@@ -1218,11 +1607,17 @@ class Dispatcher:
             },
         }
 
+    def _parse_acceptance_command(self, command: str) -> tuple[list[str] | None, str | None]:
+        return prepare_acceptance_command(command)
+
     def _save_task_manifest(self, store: ArtifactStore, manifest: dict, manifest_version: int) -> None:
         store.save("task-manifest.yaml", manifest)
         if manifest_version > 1:
             store.save(f"task-manifest-v{manifest_version}.yaml", manifest)
         self._materialize_task_files(manifest.get("tasks", []))
+        # v2: build task packets for all tasks
+        if self.context_mgr:
+            self.context_mgr.build_all_task_packets(manifest)
 
     def _materialize_task_files(self, tasks: list[dict]) -> None:
         if self.feature_dir is None:
@@ -1300,6 +1695,10 @@ class Dispatcher:
         })
         iterations[loop_name] = loop_state
         self._update_status(iterations=iterations)
+        label = "plan review" if loop_name == "plan_review" else loop_name.replace("_", " ")
+        if loop_name == "task_review":
+            label = "task review"
+        self.tui.set_loop_progress(label, current, maximum)
 
     def _set_quality_iteration(self, task_id: str, current: int, maximum: int) -> None:
         state = self.state_file.read()
@@ -1308,6 +1707,7 @@ class Dispatcher:
         quality[task_id] = {"current": current, "max": maximum}
         iterations["quality_loop"] = quality
         self._update_status(iterations=iterations)
+        self.tui.set_loop_progress("quality", current, maximum)
 
     def _record_gap_round(self, depth: int, maximum: int, gap_report: dict) -> None:
         state = self.state_file.read()
@@ -1322,6 +1722,7 @@ class Dispatcher:
         })
         iterations["gap_reentry"] = gap_state
         self._update_status(iterations=iterations)
+        self.tui.set_loop_progress("gap re-entry", depth, maximum)
 
     def _findings_hash(self, findings: list[str]) -> str:
         canonical = "\n".join(sorted(findings))
@@ -1357,7 +1758,8 @@ class Dispatcher:
 
     def _only_verification_spec_failures(self, test_report: dict) -> bool:
         failures = test_report.get("regression_failures", [])
-        return bool(failures) and all("missing command" in failure for failure in failures)
+        markers = ("missing command", "unsupported shell syntax", "invalid command syntax", "empty command", "invalid python -c program")
+        return bool(failures) and all(any(marker in failure for marker in markers) for failure in failures)
 
     def _review_task_without_command_checks(self, task_id: str, prompt_builder: PromptBuilder, store: ArtifactStore, config: dict) -> bool:
         self.tui.info(f"{task_id}: acceptance commands are missing; falling back to spec review instead of looping code fixes.")
@@ -1440,7 +1842,14 @@ class Dispatcher:
             raw = raw[:2000] + f"\n... ({len(raw)} chars total, truncated)"
         self.tui.error(f"  Raw output:\n{raw}")
 
+    def _handle_budget_exhausted(self, sm: PipelineStateMachine, message: str) -> None:
+        self.tui.set_stage(PipelineStage.BLOCKED.value)
+        self.tui.error(message)
+        sm.transition(PipelineStage.BLOCKED)
+        self._update_status(status="waiting_for_human", gate_reason="budget_exhausted")
+
     def _fail_pipeline(self, sm: PipelineStateMachine, message: str) -> None:
+        self.tui.set_stage(PipelineStage.FAILED.value)
         self.tui.error(message)
         sm.transition(PipelineStage.FAILED)
         self._update_status(status="failed")
@@ -1450,8 +1859,9 @@ class Dispatcher:
             sm.transition(PipelineStage.COMPLETION)
         self.tui.cost_summary(self.total_cost_usd)
         if not self._requires_completion_confirmation():
-            self.tui.stage("Stage 16: Completion Summary")
+            self.tui.stage("Stage 16: Completion Summary", stage_key=PipelineStage.COMPLETION.value)
             sm.transition(PipelineStage.DONE)
+            self.tui.set_stage(PipelineStage.DONE.value)
             self._update_status(status="completed", gate_reason="")
             store.save(
                 "completion.yaml",
@@ -1492,9 +1902,27 @@ class Dispatcher:
         (feature_dir / "tasks" / "done").mkdir(parents=True, exist_ok=True)
         (feature_dir / "logs").mkdir(parents=True, exist_ok=True)
         (feature_dir / "decisions").mkdir(parents=True, exist_ok=True)
+        # v2 directories
+        (feature_dir / "context").mkdir(parents=True, exist_ok=True)
+        (feature_dir / "context" / "task-packets").mkdir(parents=True, exist_ok=True)
+        (feature_dir / "lanes").mkdir(parents=True, exist_ok=True)
+        (feature_dir / "validation-failures").mkdir(parents=True, exist_ok=True)
 
     def _update_status(self, **fields) -> None:
         if self.state_file is not None:
+            self.state_file.update(**fields)
+
+    def _persist_v2_state(self) -> None:
+        """Persist lane and budget state. Called at pipeline checkpoints, not every status update."""
+        if self.state_file is None:
+            return
+        fields: dict = {}
+        if self.lanes:
+            fields["lane_sessions"] = self.lanes.get_all_lane_states()
+        if self.budget:
+            fields["budget_costs"] = self.budget.get_all_costs()
+            fields["budget_checkpoints"] = self.budget.get_checkpoints()
+        if fields:
             self.state_file.update(**fields)
 
     def _load_config(self) -> dict:
