@@ -73,12 +73,39 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `ExecutionOutput` schema (Section 9 — Canonical Schema Reference).
-All changed files go in a single `files_changed` list (with `action: created | modified | deleted`).
-Task IDs use format `task-NNN` (zero-padded, e.g. `task-001`).
-Populate branch/commit traceability fields when available: `branch_name`, `branch_head_commit`, `task_commit_hash`, `upstream_branch`, `upstream_head_commit`, `branch_pushed`.
+Output must conform to the `ExecutionOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full ExecutionOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: execution_result
+task_id: task-001                    # REQUIRED, format task-NNN
+status: completed                    # completed | blocked | deviated
+summary: "At least 10 chars describing what was done"   # REQUIRED string
+files_changed:
+  - path: src/example.py
+    action: created                  # created | modified | deleted
+    description: "What changed"
+  - path: src/other.py
+    action: modified
+    description: "What changed"
+commits:
+  - hash: "abc123"
+    message: "xpatcher(task-001): Description"
+deviations: []                       # list of strings
+blockers: []                         # list of strings
+branch_name: "feature/branch-name"
+branch_head_commit: "abc123def"
+task_commit_hash: "abc123def"
+upstream_branch: "origin/feature/branch-name"
+upstream_head_commit: "abc123def"
+branch_pushed: false
+```
+
+CRITICAL — common validation mistakes:
+- `status` MUST be exactly `completed`, `blocked`, or `deviated` (not `success`, `failed`, `done`)
+- `action` in files_changed MUST be `created`, `modified`, or `deleted` (not `added`, `updated`, `removed`)
+- `task_id` MUST be zero-padded: `task-001` not `task-1`
 
 ## Anti-Patterns to Avoid
 - Do NOT declare victory prematurely. Verify your work compiles and tests pass.

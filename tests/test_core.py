@@ -102,7 +102,7 @@ class TestDispatcherArtifacts:
 
         monkeypatch.setattr(
             dispatcher,
-            "_invoke_validated_agent",
+            "_invoke_validated_stage",
             lambda *args, **kwargs: (
                 AgentResult(),
                 type("V", (), {"valid": True, "data": {"type": "review", "task_id": "task-001", "verdict": "approve", "confidence": "high", "summary": "Code matches the task", "findings": []}})(),
@@ -121,7 +121,7 @@ class TestDispatcherArtifacts:
 
 
 class TestDispatcherCancellation:
-    def test_invoke_agent_raises_when_pipeline_is_cancelled(self, tmp_path):
+    def test_invoke_stage_raises_when_pipeline_is_cancelled(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
         dispatcher.state_file.write(
             {
@@ -135,7 +135,7 @@ class TestDispatcherCancellation:
         )
 
         try:
-            dispatcher._invoke_agent("planner", "plan", {"models": {}, "timeouts": {}}, "planning")
+            dispatcher._invoke_stage("plan", {"main_agent": {"timeout": 900}}, "planning")
         except CancelledPipelineError:
             pass
         else:
@@ -143,7 +143,7 @@ class TestDispatcherCancellation:
 
 
 class TestDispatcherPersistence:
-    def test_invoke_agent_persists_cost_and_logs(self, tmp_path):
+    def test_invoke_stage_persists_cost_and_logs(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
         dispatcher.session.invoke = lambda invocation: AgentResult(
             session_id="sess-1",
@@ -154,15 +154,14 @@ class TestDispatcherPersistence:
             usage={"input_tokens": 10, "output_tokens": 5},
         )
 
-        dispatcher._invoke_agent(
-            agent="tech-writer",
+        dispatcher._invoke_stage(
             prompt="write docs",
-            config={"models": {}, "timeouts": {}},
+            config={"main_agent": {"timeout": 900}},
             stage="documentation",
         )
 
         state = dispatcher.state_file.read()
-        log_files = list((dispatcher.feature_dir / "logs").glob("agent-tech-writer-*.jsonl"))
+        log_files = list((dispatcher.feature_dir / "logs").glob("*documentation*.jsonl"))
 
         assert state["total_cost_usd"] == 1.25
         assert log_files
@@ -195,7 +194,7 @@ class TestResumeHumanGate:
         monkeypatch.setattr(Dispatcher, "_run_gap_detection_with_reentry", lambda *args, **kwargs: True)
         monkeypatch.setattr(
             Dispatcher,
-            "_invoke_validated_agent",
+            "_invoke_validated_stage",
             lambda *args, **kwargs: (AgentResult(), type("V", (), {"valid": True, "data": {"type": "docs_report", "summary": "Updated docs"}})()),
         )
         monkeypatch.setattr(Dispatcher, "_handle_completion_gate", lambda *args, **kwargs: None)
@@ -401,7 +400,7 @@ class TestGapReentryBlocked:
             (AgentResult(), type("V", (), {"valid": True, "data": task_manifest_data})()),
             (AgentResult(), type("V", (), {"valid": True, "data": review_data})()),
         ])
-        monkeypatch.setattr(dispatcher, "_invoke_validated_agent", lambda *args, **kwargs: next(responses))
+        monkeypatch.setattr(dispatcher, "_invoke_validated_stage", lambda *args, **kwargs: next(responses))
         monkeypatch.setattr(dispatcher, "_run_prioritization_and_execution", lambda *args, **kwargs: False)
 
         sm = PipelineStateMachine(dispatcher.state_file)

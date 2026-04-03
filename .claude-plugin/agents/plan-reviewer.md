@@ -114,11 +114,47 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `ReviewOutput` schema (Section 9 — Canonical Schema Reference).
-Severity values: `critical | major | minor | nit`.
-Category values: `correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency`.
+Output must conform to the `PlanReviewOutput` schema (for plan reviews) or `TaskManifestReviewOutput` schema (for task manifest reviews). Use EXACTLY these field names and types:
 
-<!-- At build time, the full ReviewOutput schema is injected here from the Pydantic model. -->
+**Plan review (Stage 3):**
+```yaml
+---
+version: "1.0"
+type: plan_review
+plan_version: 1                      # REQUIRED integer
+verdict: approved                    # approved | needs_changes | rejected
+confidence: high                     # high | medium | low (NOT numeric)
+summary: "At least 10 chars summarizing the review"   # REQUIRED string
+findings:
+  - id: f-001
+    severity: major                  # critical | major | minor | nit
+    category: correctness            # correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency
+    file: src/example.py
+    line_range: ""
+    description: "At least 10 chars describing the issue"
+    suggestion: ""
+    evidence: ""
+```
+
+**Task manifest review (Stage 7):**
+```yaml
+---
+version: "1.0"
+type: task_manifest_review
+manifest_version: 1                  # REQUIRED integer
+verdict: approved                    # approved | needs_changes | rejected
+confidence: high
+summary: "At least 10 chars summarizing the review"
+findings: []
+```
+
+CRITICAL — common validation mistakes:
+- For plan reviews, `type` MUST be `plan_review` (not `review`)
+- For task manifest reviews, `type` MUST be `task_manifest_review`
+- `verdict` for plan/task reviews uses `approved` (not `approve`)
+- `severity` MUST be exactly `critical`, `major`, `minor`, or `nit`
+- `category` MUST be one of: `correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency`
+- Non-approved verdicts MUST include at least one finding
 
 ## Constraints
 - You MUST NOT modify any project files. You MAY only use Write to save the output artifact to the path specified in the prompt.

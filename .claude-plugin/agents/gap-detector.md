@@ -62,10 +62,30 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `GapOutput` schema (Section 9 — Canonical Schema Reference).
-Gap severity: `critical | major | minor`. Gap category: `plan-coverage | error-handling | edge-case | migration | documentation | integration`.
+Output must conform to the `GapOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full GapOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: gap_report
+verdict: complete                    # complete | gaps_found
+gaps:
+  - id: G-001
+    severity: major                  # critical | major | minor
+    category: plan-coverage          # plan-coverage | error-handling | edge-case | migration | documentation | integration
+    description: "At least 10 chars describing the gap"   # REQUIRED
+    location: "src/example.py:42"    # string, default ""
+    recommendation: "How to fix it"  # string, default ""
+plan_completeness: "All spec items implemented"   # string, default ""
+overall_risk: low                    # low | medium | high
+```
+
+CRITICAL — common validation mistakes:
+- `verdict` MUST be exactly `complete` or `gaps_found` (not `pass`, `no_gaps`, `found`)
+- `severity` MUST be exactly `critical`, `major`, or `minor` (not `high`, `blocking`, `low`)
+- `category` MUST be one of: `plan-coverage | error-handling | edge-case | migration | documentation | integration` (hyphenated, not underscored)
+- `overall_risk` MUST be exactly `low`, `medium`, or `high`
+- If `verdict` is `gaps_found`, you MUST include at least one gap
 
 ## Constraints
 - You MUST NOT modify any project files. You MAY only use Write to save the output artifact to the path specified in the prompt.

@@ -64,6 +64,13 @@ class TUIRenderer:
         # Terminal bell
         print("\a", end="", flush=True)
 
+    def agent_result(self, text: str, is_error: bool = False):
+        """Show agent's final message with a colored left stripe."""
+        color = self.RED if is_error else self.GREEN
+        stripe = f"{color}│{self.RESET}"
+        for line in text.splitlines():
+            print(f"  {stripe} {self.DIM}{line}{self.RESET}")
+
     def cost_update(self, total_cost: float):
         print(f"{self._prefix()}{self.DIM}Running cost: ${total_cost:.4f}{self.RESET}")
 

@@ -1,14 +1,14 @@
 templates:
   intent_capture: |
-    Analyze this feature request and produce a structured specification intent document.
+    Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
+
+    Task for the planner: Analyze this feature request and produce a structured specification intent document.
 
     Feature request: $description
 
     Project directory: $project_dir
 
-    Explore the codebase to understand the current structure, stack, conventions, test strategy, and delivery workflow. The project may be written in any language or combination of languages. Do not assume Python. Infer the repo's real tooling from files such as package manifests, lockfiles, build scripts, CI configs, framework configs, Docker files, Makefiles, or task runners.
-
-    Output a YAML intent document conforming to the IntentOutput schema with: goal, scope, constraints, and any clarifying questions. This is the contract for the pipeline: make it detailed enough to guide implementation and review, but treat it as an ephemeral working specification. Once code lands, the source tree is the only long-term source of truth.
+    Output a YAML intent document conforming to the IntentOutput schema with: goal, scope, constraints, and any clarifying questions.
 
     Schema rules:
     - Use `type: intent`
@@ -20,223 +20,177 @@ templates:
     Write the YAML output to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   planner: |
-    Create a thorough executable specification based on the intent at: $intent_path
+    Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
+
+    Task for the planner: Create a thorough executable specification based on the intent at: $intent_path
 
     Project directory: $project_dir
 
-    Read the intent, explore the codebase, and produce a structured YAML plan conforming to the PlanOutput schema. The project may be backend, frontend, CLI, mobile, infrastructure, library, monorepo, or mixed-language. Ground the plan in the actual stack and commands found in the repository rather than defaulting to any one ecosystem.
+    Read the intent, explore the codebase, and produce a structured YAML plan conforming to the PlanOutput schema.
 
-    Requirements:
-    - Acceptance criteria must be concrete, measurable, and expressed as plain strings
-    - Prefer acceptance criteria that can later be translated into runnable repo-root commands
-    - Use the repository's real build, test, lint, type-check, package, and migration workflows where they exist
-    - Call out stack-specific risks: API compatibility, schema/data migration, build pipeline impact, deployment/runtime config, browser/mobile behavior, permissions, or performance hotspots as relevant
-    - The plan is a temporary specification artifact: it must be detailed, implementation-grounded, and reviewable, but it must not become a second long-term truth alongside the code
-
-    Design quality — apply before finalizing the spec:
-    - Reuse first: search the codebase for existing utilities, helpers, and patterns before specifying new ones. If equivalent functionality exists, reference it instead of introducing parallel implementations.
-    - Simplicity over speculation: specify the simplest design that meets stated requirements. No abstractions, indirection layers, or extension points for hypothetical future needs.
-    - Efficiency by design: avoid specifying redundant operations, prefer batch over item-by-item where supported, note concurrency opportunities for independent operations, do not add blocking work to hot paths.
-    - Quality constraints: prefer extending existing interfaces over new parameters, avoid specifying state that duplicates or could be derived, use existing constants/enums/typed values rather than raw strings.
+    Required PlanOutput schema structure:
+    - type: plan
+    - summary: string (min 20 chars)
+    - phases: list of {id: "phase-N", name: string, description: string, tasks: [...]}
+    - Each task: {id: "task-NNN", description: string (min 10 chars), files: [paths], acceptance: string|list, depends_on: [task-ids], estimated_complexity: low|medium|high}
+    - risks: list of {description: string, mitigation: string, severity: low|medium|high} — NOT plain strings
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML output to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   plan_reviewer: |
-    Review the executable specification at: $plan_path
+    Delegate this task to @agent-plan-reviewer — do NOT do this work yourself, you MUST use the Agent tool to spawn the plan-reviewer subagent.
+
+    Task for the plan-reviewer: Review the executable specification at: $plan_path
     Original intent at: $intent_path
 
     Verify feasibility by checking that referenced files, modules, packages, entry points, configs, and commands actually make sense in: $project_dir.
-
-    Review dimensions — evaluate each:
-
-    Functional soundness: scope alignment with intent, feasibility of referenced files/APIs, behavioral precision (is "done" unambiguous?), risk coverage, completeness (error handling, tests, config, docs), dependency accuracy.
-
-    Code reuse: does the spec introduce new utilities or patterns when equivalent functionality already exists in the codebase? Search the repository before accepting new abstractions. Flag plans that build parallel approaches to solved problems.
-
-    Code quality: does the spec overengineer the solution — unnecessary abstractions, speculative generality, indirection for hypothetical future needs? Flag parameter sprawl, redundant state, or logic that duplicates existing logic in a different form. The simplest design that meets stated requirements is the correct one.
-
-    Efficiency: does the spec specify redundant operations, overly broad reads, or avoidable work? Are independent operations planned sequentially when they could be concurrent? Does it add blocking work to hot paths?
-
-    Structure: decomposition quality (cohesion and verifiability, not file count), acceptance criteria quality (measurable, automatable), ordering and dependencies, anti-scope verification.
-
-    Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
     The file must start with --- and contain only valid YAML conforming to PlanReviewOutput schema. Do not include prose or code block markers.
   plan_fix: |
-    Revise the executable specification at: $plan_path
+    Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
+
+    Task for the planner: Revise the executable specification at: $plan_path
     Based on review findings at: $review_path
 
-    Address all critical and major findings. Strengthen missing behavioral detail, edge cases, compatibility concerns, and verification steps. Keep the plan aligned with the repository's real language/toolchain rather than generic assumptions.
+    Address all critical and major findings. Strengthen missing behavioral detail, edge cases, compatibility concerns, and verification steps.
 
-    For reuse findings: replace newly specified utilities/patterns with references to existing codebase implementations. For overengineering findings: simplify the design — remove unnecessary abstractions, speculative generality, and indirection that does not serve current requirements. For efficiency findings: eliminate redundant operations and note concurrency opportunities.
+    IMPORTANT — the output must conform to PlanOutput schema exactly:
+    - type: plan
+    - summary: string (min 20 chars)
+    - phases: list of {id: "phase-N", name: string, description: string, tasks: [...]}
+    - Each task: {id: "task-NNN", description: string (min 10 chars), files: [paths], acceptance: string|list, depends_on: [task-ids], estimated_complexity: low|medium|high}
+    - risks: list of {description: string, mitigation: string, severity: low|medium|high} — NOT plain strings
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the revised plan as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   task_breakdown: |
-    Decompose the approved specification at: $plan_path into execution slices.
+    Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
 
-    If the specification describes a single cohesive change (bug fix, small feature, focused refactor), produce a manifest with ONE task. Do not artificially split work to create multiple tasks. Only decompose when the specification genuinely contains multiple independent concerns.
+    Task for the planner: Decompose the approved specification at: $plan_path into execution slices.
 
-    Each task must satisfy these decomposition criteria:
-    1. Single Responsibility — one logical change per task. "Add endpoint and its tests" is one task. "Add endpoint and refactor logging" is two.
-    2. Green State — after this task, the codebase compiles and all pre-existing tests pass. Never leave broken imports, dead code paths, or half-wired integrations between tasks.
-    3. Independently Verifiable — each task must be testable on its own with at least one behavioral acceptance criterion. If a task cannot be meaningfully tested without another task completing first, merge them.
-    4. Anti-Fragmentation — do NOT split if subtasks have mandatory sequential dependencies AND the intermediate state is neither useful nor testable on its own. Things that succeed-or-fail together are one task.
-    5. Single-Task Requests — if the specification is a single cohesive change, produce one task. A bug fix, a small feature, or a focused refactor is often best expressed as one task.
+    If the specification describes a single cohesive change, produce a manifest with ONE task. Only decompose when genuinely needed.
 
-    There is no file-count cap. Size tasks by cohesion and verifiability, not by number of files touched.
-
-    Each task must have: id (task-NNN format), title, description, files_in_scope (guidance for the executor, not a hard constraint), acceptance_criteria with executable command checks, depends_on, estimated_complexity, quality_tier, and optionally rationale explaining why this is one task.
-
-    Complexity is structural, not temporal:
-    - low: single module/layer, tests follow existing patterns
-    - medium: 2-3 interacting modules, existing integration points
-    - high: crosses major architectural boundaries, new patterns introduced
+    Each task must have: id (task-NNN format), title, description, files_in_scope (plain path strings), acceptance_criteria with executable command checks, depends_on, estimated_complexity (low|medium|high), quality_tier (lite|standard|thorough).
 
     Hard requirements for acceptance_criteria:
     - Every task must include at least one item with severity: must_pass
     - Every must_pass item must use verification: command
-    - Put the actual repo-root shell command in the command field itself, not in description or notes
-    - Commands must be executable as written, with no placeholders like TODO, TBD, or <command>
-    - Prefer the repository's native verification commands: test runners, build checks, type checks, linters, framework CLIs, migration/status commands, smoke scripts, or small language/runtime invocations appropriate for the stack
-    - Do not assume Python or pytest unless the repository actually uses them
-    - Aim for no more than 5 behavioral acceptance criteria per task; more suggests the task is doing too many unrelated things
+    - Put the actual repo-root shell command in the command field itself
+    - Commands must be executable as written, with no placeholders
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the task manifest as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to TaskManifestOutput schema. Do not include prose or code block markers.
   task_reviewer: |
-    Review the execution-slice breakdown at: $manifest_path
+    Delegate this task to @agent-plan-reviewer — do NOT do this work yourself, you MUST use the Agent tool to spawn the plan-reviewer subagent.
 
-    Verify that:
-    - Tasks cover the full specification
-    - Each task has a single clear responsibility (not multiple unrelated concerns joined by "and")
-    - After each task completes, the codebase would be in a green state (compiles, existing tests pass)
-    - Each task is independently verifiable with behavioral acceptance criteria
-    - Tasks are not over-fragmented: if two tasks have mandatory sequential dependencies and the intermediate state is not independently testable, they should be merged
-    - A simple specification is not artificially split into multiple tasks
-    - Dependencies are correct with no circular dependencies
-    - Complexity estimates reflect structural scope (low/medium/high), not time guesses
-    - Acceptance criteria are testable and every task has at least one must_pass command-based criterion
+    Task for the plan-reviewer: Review the execution-slice breakdown at: $manifest_path
 
-    Reject the manifest if any task lacks a must_pass command-based acceptance criterion, if a command is missing, misplaced, obviously non-executable from the repo root, or mismatched to the repository's actual stack.
+    Verify tasks cover the full specification, each has a single clear responsibility, and every task has at least one must_pass command-based criterion.
+
+    Reject the manifest if any task lacks a must_pass command-based acceptance criterion.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
     The file must start with --- and contain only valid YAML conforming to TaskManifestReviewOutput schema. Do not include prose or code block markers.
   task_fix: |
-    Revise the task manifest at: $manifest_path
+    Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
+
+    Task for the planner: Revise the task manifest at: $manifest_path
     Based on review findings at: $review_path
 
-    Address all critical and major findings. Make the execution slices more precise, more independently verifiable, and less reliant on human interpretation. Every task must leave this stage with at least one concrete must_pass command in acceptance_criteria[].command. Do not bury commands in prose.
+    Address all critical and major findings. Every task must have at least one concrete must_pass command in acceptance_criteria[].command.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the revised task manifest as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   executor: |
-    Implement task $task_id.
+    Delegate this task to @agent-executor — do NOT do this work yourself, you MUST use the Agent tool to spawn the executor subagent.
+
+    Task for the executor: Implement task $task_id.
 
     Task definition: $task_file
     Plan: $feature_dir/plan-v*.yaml (read the latest version)
     Project: $project_dir
 
-    Treat the task definition and latest plan as the working specification. Implement exactly the required behavior, keep tests and verification aligned to observable outcomes, and remember that once merged the source code is the only long-term source of truth.
-
-    Git and traceability requirements:
-    - Stay on the existing xpatcher feature branch created for this pipeline
+    Git requirements:
+    - Stay on the existing xpatcher feature branch
     - Commit with message: xpatcher($task_id): <title>
     - Report the commit hash(es) you created
-    - If the branch already tracks a remote, report whether the task commit is already pushed; if not, say so explicitly
-    - If you discover that the current branch name or git state does not match the task context, report it as a blocker instead of guessing
-
-    The repository may use any language, framework, build system, or test runner. Use the project's actual tooling and conventions.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the execution result as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ExecutionOutput schema. Do not include prose or code block markers.
   executor_fix: |
-    Fix the issues found in task $task_id.
+    Delegate this task to @agent-executor — do NOT do this work yourself, you MUST use the Agent tool to spawn the executor subagent.
+
+    Task for the executor: Fix the issues found in task $task_id.
 
     Findings to address:
     $findings_text
 
     Project: $project_dir
 
-    Fix the issues against the existing working specification and keep the resulting code as the authoritative behavior. Use the repository's real verification commands. Report any new commit hashes created while fixing.
+    Fix the issues and report any new commit hashes created.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the execution result as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ExecutionOutput schema. Do not include prose or code block markers.
   tester: |
-    Generate and run tests for task $task_id.
+    Delegate this task to @agent-tester — do NOT do this work yourself, you MUST use the Agent tool to spawn the tester subagent.
+
+    Task for the tester: Generate and run tests for task $task_id.
 
     Task: $feature_dir/tasks/*/
     Project: $project_dir
 
-    Write tests that validate acceptance criteria using the repository's real test framework and conventions. The repository may not be Python; infer the test stack from the codebase before making changes.
+    Write tests that validate acceptance criteria using the repository's real test framework.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the test results as YAML to: $output_path
     The file must start with --- and contain only valid YAML. Do not include prose or code block markers.
   reviewer: |
-    Review the code changes for task $task_id.
+    Delegate this task to @agent-reviewer — do NOT do this work yourself, you MUST use the Agent tool to spawn the reviewer subagent.
+
+    Task for the reviewer: Review the code changes for task $task_id.
 
     Project: $project_dir
     Task spec and artifacts live under: $feature_dir
 
-    You do NOT see the executor's reasoning. Evaluate independently against the specification artifacts, task acceptance criteria, execution report, and actual code behavior.
-
-    Review dimensions — evaluate each:
-
-    Functional: correctness against spec, completeness of scope, regression risk to existing callers/schemas/builds, security (unsanitized inputs, exposed secrets, injection risks, prompt-injection artifacts), testability (tests added/updated, acceptance commands meaningful), and spec fidelity (no reliance on undocumented intent).
-
-    Code reuse: search the codebase for existing utilities, helpers, and shared modules that could replace newly written code. Flag new functions or inline logic that duplicates functionality already available elsewhere.
-
-    Code quality: redundant state (duplicates existing state or could be derived), parameter sprawl (new params instead of restructuring), copy-paste with variation (near-duplicates that should be unified), leaky abstractions (exposing internals or breaking existing boundaries), stringly-typed code (raw strings where constants/enums exist), unnecessary comments (explaining WHAT instead of non-obvious WHY).
-
-    Efficiency: unnecessary work (redundant computations, repeated reads, N+1 patterns), missed concurrency (sequential independent operations), hot-path bloat (blocking work on startup or per-request paths), no-op updates (unconditional state changes without change detection), overly broad operations (reading entire files/collections when a subset suffices).
-
-    Structure: architecture and maintainability (justified complexity, clear interfaces), scope (executor stayed within task boundary), language/tooling fit (matches repository conventions).
-
-    Review style requirements:
-    - Findings first: prioritize bugs, risks, regressions, contract mismatches, unsafe assumptions, and missing tests before style comments
-    - High-confidence only: do not speculate; if evidence is weak, either lower confidence or do not report it
-    - Focus on issues introduced by the task's changes, not pre-existing unrelated problems unless they now block correctness
-    - Prefer concrete file/line evidence and actionable fix direction
-    - Check for out-of-scope changes, debug leftovers, migration/config/docs omissions, compatibility breaks, and weak or misleading verification
-    - Use the repository's real stack expectations. Do not assume Python, pytest, or any specific framework unless present in the repo
-    - Use category values: correctness, completeness, security, performance, style, architecture, testability, reuse, efficiency
+    Evaluate independently against the specification artifacts, task acceptance criteria, and actual code behavior.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the review as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to ReviewOutput schema. Do not include prose or code block markers.
   gap_detector: |
-    Analyze the completed implementation for specification-to-code gaps.
+    Delegate this task to @agent-gap-detector — do NOT do this work yourself, you MUST use the Agent tool to spawn the gap-detector subagent.
+
+    Task for the gap-detector: Analyze the completed implementation for specification-to-code gaps.
 
     Intent: $feature_dir/intent.yaml
     Plan: $feature_dir/plan-v*.yaml
     Tasks: $feature_dir/tasks/done/
     Project: $project_dir
 
-    Check: specification coverage, API/contract coverage, error handling, edge cases, migration/data compatibility, configuration/runtime wiring, documentation, integration boundaries, and whether the implemented code is complete enough that the codebase can stand alone after the temporary spec artifacts are discarded.
-
-    The project may use any language or platform. Evaluate gaps against the actual stack and deployment model, not Python-specific assumptions.
+    Check: specification coverage, API/contract coverage, error handling, edge cases, migration/data compatibility, configuration/runtime wiring, documentation, integration boundaries.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the gap report as YAML to: $output_path
     The file must start with --- and contain only valid YAML conforming to GapOutput schema. Do not include prose or code block markers.
   tech_writer: |
-    Update documentation for the implemented changes.
+    Delegate this task to @agent-tech-writer — do NOT do this work yourself, you MUST use the Agent tool to spawn the tech-writer subagent.
+
+    Task for the tech-writer: Update documentation for the implemented changes.
 
     Intent: $feature_dir/intent.yaml
     Tasks: $feature_dir/tasks/done/
     Project: $project_dir
 
-    Update existing docs. Create new docs only for wholly new features. Documentation must describe the shipped code, not preserve or restate ephemeral planning artifacts. Use the documentation formats and conventions already present in the repository, whether Markdown, reStructuredText, inline code docs, generated docs, or framework-specific docs.
+    Update existing docs. Create new docs only for wholly new features.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the docs report as YAML to: $output_path

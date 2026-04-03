@@ -59,10 +59,34 @@ You may ONLY write to files matching these patterns:
 Respond with a single YAML document. Start with --- on its own line.
 Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
 
-Output must conform to the `TestOutput` schema (Section 9 — Canonical Schema Reference).
-Each test is a `TestResult` with status: `passed | failed | skipped | error`.
+Output must conform to the `TestOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full TestOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: test_result
+task_id: task-001                    # REQUIRED, format task-NNN
+overall: pass                        # pass | fail | error
+test_results:
+  - name: "test_feature_works"
+    status: passed                   # passed | failed | skipped | error
+    duration_ms: 150                 # integer, milliseconds
+    error_message: ""                # string, default ""
+  - name: "test_edge_case"
+    status: failed
+    duration_ms: 50
+    error_message: "AssertionError: expected 42 got 0"
+coverage_pct: 85.5                   # float 0.0-100.0, default 0.0
+new_tests_added: 3                   # integer >= 0
+regression_failures: []              # list of strings
+```
+
+CRITICAL — common validation mistakes:
+- `overall` MUST be exactly `pass`, `fail`, or `error` (not `passed`, `failed`, `success`)
+- `status` in test_results MUST be exactly `passed`, `failed`, `skipped`, or `error`
+- `duration_ms` MUST be an integer (not a string like "150ms")
+- `coverage_pct` MUST be between 0.0 and 100.0
+- `task_id` MUST be zero-padded: `task-001` not `task-1`
 
 ## Constraints
 - Only write to test files (see Test File Scope above).

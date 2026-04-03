@@ -206,12 +206,16 @@ class AcceptanceCriterion(BaseModel):
     @field_validator("command")
     @classmethod
     def command_required_for_command_checks(cls, v: str, info) -> str:
+        import re as _re
         command = v.strip()
         if info.data.get("verification") == "command" and not command:
             raise ValueError("Command-based acceptance criteria require a command")
         lowered = command.lower()
-        placeholder_tokens = ("todo", "tbd", "n/a", "<command>", "fill me in")
-        if info.data.get("verification") == "command" and any(token in lowered for token in placeholder_tokens):
+        # Word-boundary match to avoid false positives like "bin/activate" matching "n/a"
+        placeholder_patterns = (r"\btodo\b", r"\btbd\b", r"\bn/a\b", r"<command>", r"fill me in")
+        if info.data.get("verification") == "command" and any(
+            _re.search(pat, lowered) for pat in placeholder_patterns
+        ):
             raise ValueError("Command-based acceptance criteria require a concrete executable command")
         return command
 
@@ -252,7 +256,7 @@ class ReviewFinding(BaseModel):
     id: str
     severity: ReviewSeverity
     category: ReviewCategory
-    file: str
+    file: str = ""
     line_range: str = ""
     description: str = Field(..., min_length=10)
     suggestion: str = ""
@@ -527,6 +531,23 @@ class ArtifactValidator:
         # ── Global: type/kind alias ──────────────────────────────────────
         if "type" not in data and isinstance(data.get("kind"), str):
             data["type"] = data["kind"]
+        # Common type name mismatches
+        _TYPE_ALIASES = {
+            "task_review": "task_manifest_review",
+            "manifest_review": "task_manifest_review",
+            "execution_output": "execution_result",
+            "execution": "execution_result",
+            "test": "test_result",
+            "test_output": "test_result",
+            "gap": "gap_report",
+            "gaps": "gap_report",
+            "docs": "docs_report",
+            "documentation": "docs_report",
+            "simplify": "simplification",
+            "simplification_output": "simplification",
+        }
+        if data.get("type") in _TYPE_ALIASES:
+            data["type"] = _TYPE_ALIASES[data["type"]]
         artifact_type = data.get("type", expected_type)
 
         # ── Coerce null → "" for all top-level string fields ─────────────
@@ -584,12 +605,44 @@ class ArtifactValidator:
                 if not isinstance(finding, dict):
                     continue
                 _null_to_empty_str(finding, ("file", "line_range", "suggestion", "evidence"))
+                # Default missing fields
+                finding.setdefault("file", "")
+                finding.setdefault("line_range", "")
+                finding.setdefault("suggestion", "")
+                finding.setdefault("evidence", "")
                 # Auto-generate finding IDs
                 if "id" not in finding:
                     finding["id"] = f"f-{id(finding) % 10000:04d}"
                 # location → file fallback
                 if not finding.get("file") and finding.get("location"):
                     finding["file"] = finding["location"]
+                # severity aliases
+                _FINDING_SEV_ALIASES = {"blocking": "critical", "high": "critical",
+                                        "severe": "critical", "error": "critical",
+                                        "medium": "major", "moderate": "major",
+                                        "warning": "minor", "low": "minor",
+                                        "info": "nit", "suggestion": "nit",
+                                        "trivial": "nit", "nitpick": "nit"}
+                sev = finding.get("severity", "")
+                if isinstance(sev, str):
+                    finding["severity"] = _FINDING_SEV_ALIASES.get(sev.lower(), sev.lower())
+                # category aliases
+                _FINDING_CAT_ALIASES = {"bug": "correctness", "logic": "correctness",
+                                        "correct": "correctness",
+                                        "missing": "completeness", "incomplete": "completeness",
+                                        "scope": "completeness",
+                                        "sec": "security", "vulnerability": "security",
+                                        "auth": "security",
+                                        "perf": "performance", "speed": "performance",
+                                        "formatting": "style", "naming": "style",
+                                        "convention": "style", "lint": "style",
+                                        "design": "architecture", "structure": "architecture",
+                                        "test": "testability", "testing": "testability",
+                                        "duplicate": "reuse", "duplication": "reuse",
+                                        "redundant": "efficiency", "waste": "efficiency"}
+                cat = finding.get("category", "")
+                if isinstance(cat, str):
+                    finding["category"] = _FINDING_CAT_ALIASES.get(cat.lower(), cat.lower())
 
             # Verdict aliases
             verdict = data.get("verdict", "")
@@ -623,10 +676,18 @@ class ArtifactValidator:
         if artifact_type == "plan":
             # goal/title/description → summary
             if "summary" not in data:
-                for alt in ("goal", "description", "title", "overview"):
+                for alt in ("goal", "description", "title", "overview", "plan_summary",
+                             "objective", "purpose", "name"):
                     if alt in data and isinstance(data[alt], str) and len(data[alt]) >= 20:
                         data["summary"] = data.pop(alt)
                         break
+            # Last-resort summary from first phase description
+            if "summary" not in data:
+                phases = data.get("phases", data.get("tasks", []))
+                if phases and isinstance(phases, list) and isinstance(phases[0], dict):
+                    desc = phases[0].get("description", phases[0].get("name", ""))
+                    if isinstance(desc, str) and len(desc) >= 20:
+                        data["summary"] = desc
 
             # open_questions: dicts → strings, null → []
             if data.get("open_questions") is None:
@@ -638,9 +699,24 @@ class ArtifactValidator:
                 data["risks"] = []
             for risk in data.get("risks", []):
                 if isinstance(risk, dict):
+                    _rename_key(risk, "risk", "description")
+                    _rename_key(risk, "name", "description")
+                    _rename_key(risk, "title", "description")
                     _null_to_empty_str(risk, ("description", "mitigation"))
                     if "severity" not in risk:
                         risk["severity"] = "low"
+
+            # perspective_analysis: coerce non-string values → strings
+            pa = data.get("perspective_analysis")
+            if isinstance(pa, dict):
+                for key, val in pa.items():
+                    if isinstance(val, list):
+                        pa[key] = "; ".join(str(v) for v in val)
+                    elif isinstance(val, dict):
+                        # Extract 'analysis' key if present, else stringify
+                        pa[key] = val.get("analysis", val.get("description",
+                                   "; ".join(f"{k}: {v}" for k, v in val.items()
+                                             if k != "applicable")))
 
             # Flat tasks → single phase wrapper
             if "phases" not in data and "tasks" in data:
@@ -663,11 +739,20 @@ class ArtifactValidator:
                     if "files" not in task:
                         for alt in ("files_to_modify", "files_in_scope", "files_changed"):
                             if alt in task:
-                                raw_files = task.pop(alt)
-                                task["files"] = [f.get("path", f) if isinstance(f, dict) else f for f in raw_files]
+                                task["files"] = task.pop(alt)
                                 break
+                    # files items: coerce dicts → path strings
+                    if "files" in task and isinstance(task["files"], list):
+                        task["files"] = [
+                            f.get("path", str(f)) if isinstance(f, dict) else str(f)
+                            for f in task["files"]
+                        ]
                     if "description" not in task and "title" in task:
                         task["description"] = task["title"]
+                    # notes: coerce list → joined string
+                    notes = task.get("notes")
+                    if isinstance(notes, list):
+                        task["notes"] = "; ".join(str(n) for n in notes)
                     # acceptance list normalization
                     acceptance = task.get("acceptance")
                     if isinstance(acceptance, list):
@@ -701,12 +786,23 @@ class ArtifactValidator:
                             "command": ac if _looks_like_command(ac) else "",
                             "severity": "must_pass",
                         }
+                # files_in_scope items: coerce dicts → path strings
+                fis = task.get("files_in_scope")
+                if isinstance(fis, list):
+                    task["files_in_scope"] = [
+                        f.get("path", str(f)) if isinstance(f, dict) else str(f)
+                        for f in fis
+                    ]
                 # Defaults
                 task.setdefault("quality_tier", "lite")
                 task.setdefault("rationale", "")
-                task.setdefault("notes", "")
                 task.setdefault("files_in_scope", [])
                 task.setdefault("depends_on", [])
+                # notes: coerce list → string, then default
+                notes = task.get("notes")
+                if isinstance(notes, list):
+                    task["notes"] = "; ".join(str(n) for n in notes)
+                task.setdefault("notes", "")
                 # Complexity aliases
                 _rename_key(task, "complexity", "estimated_complexity")
 
@@ -746,6 +842,55 @@ class ArtifactValidator:
                 if data.get(key) is None:
                     data[key] = ""
 
+        # ── Test Result ──────────────────────────────────────────────────
+        if artifact_type == "test_result":
+            # overall aliases
+            _OVERALL_ALIASES = {"passed": "pass", "success": "pass",
+                                "failed": "fail", "failure": "fail"}
+            data["overall"] = _OVERALL_ALIASES.get(data.get("overall", ""), data.get("overall", ""))
+            # test_results status aliases
+            for tr in data.get("test_results", []):
+                if isinstance(tr, dict):
+                    _TR_STATUS_ALIASES = {"pass": "passed", "success": "passed",
+                                          "fail": "failed", "failure": "failed",
+                                          "skip": "skipped", "ok": "passed"}
+                    tr["status"] = _TR_STATUS_ALIASES.get(tr.get("status", ""), tr.get("status", ""))
+                    # duration_ms: coerce from string/float
+                    dur = tr.get("duration_ms")
+                    if isinstance(dur, str):
+                        tr["duration_ms"] = int("".join(c for c in dur if c.isdigit()) or "0")
+                    elif isinstance(dur, float):
+                        tr["duration_ms"] = int(dur)
+                    _null_to_empty_str(tr, ("error_message",))
+            # coverage_pct: coerce from string
+            cov = data.get("coverage_pct")
+            if isinstance(cov, str):
+                data["coverage_pct"] = float("".join(c for c in cov if c.isdigit() or c == ".") or "0")
+            # null defaults
+            data.setdefault("test_results", [])
+            data.setdefault("regression_failures", [])
+            if data.get("regression_failures") is None:
+                data["regression_failures"] = []
+
+        # ── Simplification ──────────────────────────────────────────────
+        if artifact_type == "simplification":
+            # mode aliases
+            _MODE_ALIASES = {"dry-run": "dry_run", "dryrun": "dry_run",
+                             "dryRun": "dry_run", "dry": "dry_run"}
+            data["mode"] = _MODE_ALIASES.get(data.get("mode", ""), data.get("mode", ""))
+            # simplifications items
+            for item in data.get("simplifications", []):
+                if isinstance(item, dict):
+                    # type case-folding and aliases
+                    stype = item.get("type", "")
+                    if isinstance(stype, str):
+                        _STYPE_ALIASES = {"remove-dead": "remove_dead", "dead_code": "remove_dead",
+                                          "reuse-existing": "reuse_existing", "reuse": "reuse_existing",
+                                          "deduplicate": "dedup", "duplicate": "dedup",
+                                          "inline": "flatten", "simplify": "flatten"}
+                        item["type"] = _STYPE_ALIASES.get(stype.lower(), stype.lower())
+            data.setdefault("simplifications", [])
+
         # ── Gap Report ───────────────────────────────────────────────────
         if artifact_type == "gap_report":
             # Infer verdict from gaps list
@@ -763,6 +908,25 @@ class ArtifactValidator:
                 if isinstance(gap, dict):
                     _null_to_empty_str(gap, ("location", "recommendation", "description"))
                     gap.setdefault("id", f"G-{id(gap) % 10000:04d}")
+                    # severity aliases
+                    _GAP_SEV_ALIASES = {"high": "critical", "blocking": "critical",
+                                        "medium": "major", "moderate": "major",
+                                        "low": "minor", "trivial": "minor", "nit": "minor"}
+                    sev = gap.get("severity", "")
+                    if isinstance(sev, str):
+                        gap["severity"] = _GAP_SEV_ALIASES.get(sev.lower(), sev.lower())
+                    # category aliases
+                    _GAP_CAT_ALIASES = {"coverage": "plan-coverage", "spec": "plan-coverage",
+                                        "spec-coverage": "plan-coverage", "plan_coverage": "plan-coverage",
+                                        "error": "error-handling", "errors": "error-handling",
+                                        "error_handling": "error-handling",
+                                        "edge": "edge-case", "edge_case": "edge-case",
+                                        "docs": "documentation", "doc": "documentation",
+                                        "migrate": "migration", "data": "migration",
+                                        "integrate": "integration", "api": "integration"}
+                    cat = gap.get("category", "")
+                    if isinstance(cat, str):
+                        gap["category"] = _GAP_CAT_ALIASES.get(cat.lower(), cat.lower())
 
         # ── Docs Report ──────────────────────────────────────────────────
         if artifact_type == "docs_report":
@@ -780,12 +944,17 @@ class ArtifactValidator:
                 if data.get(key) is None:
                     data[key] = []
             # Normalize doc changes
+            _DOC_ACTION_ALIASES = {"modified": "updated", "changed": "updated",
+                                   "edited": "updated", "added": "created",
+                                   "new": "created", "removed": "deleted"}
             for key in ("docs_updated", "docs_created"):
                 for dc in data.get(key, []):
                     if isinstance(dc, dict):
                         _null_to_empty_str(dc, ("section", "description", "path"))
                         if "action" not in dc:
                             dc["action"] = "updated" if key == "docs_updated" else "created"
+                        else:
+                            dc["action"] = _DOC_ACTION_ALIASES.get(dc["action"], dc["action"])
             # docs_skipped items may be dicts
             _list_of_dicts_to_strings(data, "docs_skipped", "path")
 

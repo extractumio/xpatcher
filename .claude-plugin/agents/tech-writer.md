@@ -72,10 +72,32 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `DocsReportOutput` schema (Section 9 — Canonical Schema Reference).
-Each doc change has `action: updated | created | deleted`.
+Output must conform to the `DocsReportOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full DocsReportOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: docs_report
+feature: "Feature name"              # string, default ""
+docs_updated:
+  - path: docs/README.md
+    action: updated                  # updated | created | deleted
+    section: "Installation"          # string, default ""
+    description: "Added Docker deployment instructions"
+docs_created:
+  - path: docs/docker.md
+    action: created
+    section: ""
+    description: "New Docker setup guide"
+docs_skipped:
+  - "CHANGELOG.md - no changelog convention in this project"   # plain strings
+summary: "At least 10 chars summarizing documentation changes"   # REQUIRED
+```
+
+CRITICAL — common validation mistakes:
+- `action` MUST be exactly `updated`, `created`, or `deleted` (not `modified`, `added`, `removed`)
+- `docs_skipped` items MUST be plain strings (not objects)
+- `summary` is REQUIRED and must be at least 10 characters
 
 ## Constraints
 - Only write to documentation files (see Writable File Patterns above).

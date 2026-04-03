@@ -64,27 +64,22 @@ class TestClaudeSessionInvoke:
         self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_legacy_invoke_builds_full_command_from_invocation(self, mock_run):
+    def test_invoke_builds_correct_command(self, mock_run):
         mock_run.return_value = MagicMock(
             stdout=json.dumps([]),
             returncode=0,
         )
         inv = AgentInvocation(
             prompt="do stuff",
-            agent="planner",
             session_id="sess-123",
             resume=True,
-            model="opus",
             max_turns=5,
-            allowed_tools=["Read", "Bash"],
-            disallowed_tools=["WebSearch"],
         )
         self.session.invoke(inv)
 
         cmd = mock_run.call_args[0][0]
         assert cmd == [
             "claude",
-            "--bare",
             "-p",
             "do stuff",
             "--output-format",
@@ -93,163 +88,71 @@ class TestClaudeSessionInvoke:
             "/tmp/plugin",
             "--permission-mode",
             "bypassPermissions",
-            "--agent",
-            "xpatcher:planner",
             "--resume",
             "sess-123",
             "--max-turns",
             "5",
-            "--model",
-            "opus",
-            "--allowed-tools",
-            "Read,Bash",
-            "--disallowed-tools",
-            "WebSearch",
         ]
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_preserves_already_qualified_agent_name(self, mock_run):
+    def test_no_bare_flag_in_command(self, mock_run):
+        """Verify --bare is NOT used (needed for Agent tool support)."""
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-
-        self.session.invoke(AgentInvocation(prompt="test", agent="xpatcher:planner"))
-
+        self.session.invoke(AgentInvocation(prompt="test"))
         cmd = mock_run.call_args[0][0]
-        agent_idx = cmd.index("--agent")
-        assert cmd[agent_idx + 1] == "xpatcher:planner"
-
-
-class TestClaudeSessionClaudeMdAndCommandShape:
-    """Verify CLI command includes CLAUDE.md, session-id, and correct structure."""
+        assert "--bare" not in cmd
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_command_includes_claude_md_session_id_and_agent(self, mock_run, tmp_path):
-        """Single test checking multiple CLI command properties."""
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-        claude_md = project_dir / "CLAUDE.md"
-        claude_md.write_text("# Project Guide\nUse pytest for tests.\n")
-
-        session = ClaudeSession(Path("/tmp/plugin"), project_dir)
+    def test_no_agents_flag_in_command(self, mock_run):
+        """Verify --agents is NOT used (agents loaded via --plugin-dir)."""
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-
-        session.invoke(AgentInvocation(prompt="do work", agent="planner", session_id="sess-42"))
-
+        self.session.invoke(AgentInvocation(prompt="test"))
         cmd = mock_run.call_args[0][0]
-
-        # CLAUDE.md injected
-        assert "--append-system-prompt-file" in cmd
-        idx = cmd.index("--append-system-prompt-file")
-        assert cmd[idx + 1] == str(claude_md)
-
-        # Session ID injected
-        assert "--session-id" in cmd
-        idx = cmd.index("--session-id")
-        assert cmd[idx + 1] == "sess-42"
-
-        # Agent qualified with plugin name
-        assert "--agent" in cmd
-        idx = cmd.index("--agent")
-        assert cmd[idx + 1] == "xpatcher:planner"
-
-        # Core flags present
-        assert "--bare" in cmd
-        assert "--output-format" in cmd
+        assert "--agents" not in cmd
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_command_skips_claude_md_when_absent(self, mock_run, tmp_path):
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-
-        session = ClaudeSession(Path("/tmp/plugin"), project_dir)
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-
-        session.invoke(AgentInvocation(prompt="test", agent="planner"))
-
-        cmd = mock_run.call_args[0][0]
-        assert "--append-system-prompt-file" not in cmd
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_command_template_also_gets_claude_md_and_session_id(self, mock_run, tmp_path):
+    def test_no_append_system_prompt_file(self, mock_run, tmp_path):
+        """Verify --append-system-prompt-file is NOT used (CLAUDE.md auto-discovered)."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         (project_dir / "CLAUDE.md").write_text("# Guide\n")
 
         session = ClaudeSession(Path("/tmp/plugin"), project_dir)
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+        session.invoke(AgentInvocation(prompt="test"))
+        cmd = mock_run.call_args[0][0]
+        assert "--append-system-prompt-file" not in cmd
 
-        inv = AgentInvocation(
-            prompt="test",
-            command_template=["claude", "--bare", "-p", "{prompt}"],
-            session_id="sess-99",
-        )
-        session.invoke(inv)
+
+class TestClaudeSessionCommandShape:
+    """Verify CLI command includes session-id and correct structure."""
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_command_includes_session_id(self, mock_run, tmp_path):
+        session = ClaudeSession(Path("/tmp/plugin"), tmp_path / "project")
+        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
+
+        session.invoke(AgentInvocation(prompt="do work", session_id="sess-42"))
 
         cmd = mock_run.call_args[0][0]
-
-        # Template substitution worked
-        assert cmd[:3] == ["claude", "--bare", "-p"]
-        assert cmd[3] == "test"
-
-        # CLAUDE.md injected after template expansion
-        assert "--append-system-prompt-file" in cmd
-        assert cmd[cmd.index("--append-system-prompt-file") + 1] == str(project_dir / "CLAUDE.md")
 
         # Session ID injected
         assert "--session-id" in cmd
-        assert cmd[cmd.index("--session-id") + 1] == "sess-99"
+        idx = cmd.index("--session-id")
+        assert cmd[idx + 1] == "sess-42"
 
-
-class TestClaudeSessionCommandTemplate:
-    def setup_method(self):
-        self.session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_template_substitutes_runtime_values_and_resume_args(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(
-            prompt="do stuff",
-            command_template=["claude", "-p", "{prompt}", "--plugin-dir", "{plugin_dir}", "--model", "opus"],
-            resume_args_template=["--resume", "{session_id}"],
-            session_id="sess-abc",
-            resume=True,
-        )
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert cmd == [
-            "claude",
-            "-p",
-            "do stuff",
-            "--plugin-dir",
-            "/tmp/plugin",
-            "--model",
-            "opus",
-            "--resume",
-            "sess-abc",
-        ]
+        # Core flags present
+        assert "--output-format" in cmd
+        assert "--plugin-dir" in cmd
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_template_skips_resume_args_when_no_session(self, mock_run):
+    def test_resume_uses_resume_flag(self, mock_run):
+        session = ClaudeSession(Path("/tmp/plugin"), Path("/tmp/project"))
         mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(
-            prompt="do stuff",
-            command_template=["claude", "-p", "{prompt}"],
-            resume_args_template=["--resume", "{session_id}"],
-        )
-        self.session.invoke(inv)
+        session.invoke(AgentInvocation(prompt="test", session_id="s1", resume=True))
         cmd = mock_run.call_args[0][0]
-        assert "--resume" not in cmd
-
-    @patch("src.dispatcher.session.subprocess.run")
-    def test_template_with_custom_binary(self, mock_run):
-        mock_run.return_value = MagicMock(stdout=json.dumps([]), returncode=0)
-        inv = AgentInvocation(
-            prompt="do stuff",
-            command_template=["codex", "--prompt", "{prompt}", "--model", "o3"],
-        )
-        self.session.invoke(inv)
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "codex"
-        assert cmd == ["codex", "--prompt", "do stuff", "--model", "o3"]
+        assert "--resume" in cmd
+        assert "--session-id" not in cmd  # --resume already implies session
 
 
 # ===========================================================================
@@ -263,8 +166,9 @@ class TestClaudeSessionPreflight:
     def _make_preflight_output(self, plugin_loaded=True, agents=None, is_error=False):
         """Build a minimal JSON output that mimics Claude CLI preflight."""
         if agents is None:
-            agents = list(ClaudeSession.REQUIRED_AGENTS)
-        plugins = [{"name": "xpatcher", "path": str(self.session.plugin_dir)}] if plugin_loaded else []
+            # Use qualified names as Claude Code returns them
+            agents = [f".claude-plugin:{a}" for a in ClaudeSession.REQUIRED_AGENTS]
+        plugins = [{"name": ".claude-plugin", "path": str(self.session.plugin_dir)}] if plugin_loaded else []
         events = [
             {
                 "type": "system",
@@ -296,7 +200,18 @@ class TestClaudeSessionPreflight:
         assert result.cli_version == "1.2.3"
         assert result.plugin_loaded is True
         assert len(result.agents_found) > 0
-        assert self.session.plugin_name == "xpatcher"
+
+    @patch("src.dispatcher.session.subprocess.run")
+    def test_preflight_no_bare_flag(self, mock_run):
+        """Preflight must not use --bare."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=self._make_preflight_output(),
+            stderr="",
+        )
+        self.session.preflight()
+        cmd = mock_run.call_args[0][0]
+        assert "--bare" not in cmd
 
     @patch("src.dispatcher.session.subprocess.run")
     def test_preflight_cli_not_found(self, mock_run):
@@ -327,7 +242,7 @@ class TestClaudeSessionPreflight:
     def test_preflight_missing_agents(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=self._make_preflight_output(agents=["xpatcher:planner"]),
+            stdout=self._make_preflight_output(agents=[".claude-plugin:planner"]),
             stderr="",
         )
         result = self.session.preflight()
@@ -335,19 +250,16 @@ class TestClaudeSessionPreflight:
         assert "Missing agents" in result.error
 
     @patch("src.dispatcher.session.subprocess.run")
-    def test_preflight_ignores_plugin_dir_name_for_agent_matching(self, mock_run):
-        """Plugin dir name (e.g. '.claude-plugin') differs from agent prefix ('xpatcher:').
-        Preflight must match agents by the baked prefix, not the dir name."""
-        runtime_name = ".claude-plugin"
-        # Agents are baked with xpatcher: prefix, NOT .claude-plugin:
-        agents = list(ClaudeSession.REQUIRED_AGENTS)
+    def test_preflight_matches_agents_by_bare_name(self, mock_run):
+        """Agent prefix (e.g. '.claude-plugin:') should be ignored when matching."""
+        agents = [f"custom-prefix:{a}" for a in ClaudeSession.REQUIRED_AGENTS]
         events = [
             {
                 "type": "system",
                 "subtype": "init",
                 "session_id": "sess-abc",
                 "claude_code_version": "1.2.3",
-                "plugins": [{"name": runtime_name, "path": str(self.session.plugin_dir)}],
+                "plugins": [{"name": "custom-prefix", "path": str(self.session.plugin_dir)}],
                 "agents": agents,
             },
             {
@@ -361,7 +273,3 @@ class TestClaudeSessionPreflight:
         mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(events), stderr="")
         result = self.session.preflight()
         assert result.ok is True
-        # plugin_name stays as PLUGIN_NAME for correct agent invocation
-        assert self.session.plugin_name == ClaudeSession.PLUGIN_NAME
-
-

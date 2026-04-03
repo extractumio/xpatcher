@@ -1,0 +1,1160 @@
+V2 Specification
+
+  xpatcher v2 should separate three concerns that are currently mixed together:
+
+  - reasoning continuity
+  - reusable project knowledge
+  - artifact contract enforcement
+
+  In v1, those are all pushed through one long-lived conversation, which causes schema bleed,
+  repeated rediscovery, fragile retries, and unnecessary cost. The v2 design replaces that with
+  session lanes plus explicit context artifacts plus contract-aware invocation.
+
+  This is a design spec, not a patch plan. It is intended to be implementable against the
+  current codebase centered around src/dispatcher/core.py, src/dispatcher/session.py, src/
+  context/builder.py, and src/dispatcher/schemas.py.
+
+  Design Goals
+
+  - deterministic stage behavior
+  - bounded context per stage family
+  - reusable project knowledge without repeated repo rediscovery
+  - schema-driven outputs with repair loops
+  - cost controls before execution starts
+  - explicit, inspectable, versioned context artifacts
+  - safe migration from v1 with feature flags and parity checks
+
+  Core Principles
+
+  1. Sessions are for continuity within a narrow workflow, not for storing all pipeline memory.
+  2. Reusable project understanding must live in artifacts, not transcripts.
+  3. Schemas are the canonical contract; prompts and agent instructions are generated from them
+     or derived from them.
+  4. Review loops should react to severity, not just verdict strings.
+  5. Gap handling must be delta-based, not full re-breakdown with post hoc filtering.
+  6. Deterministic stages should prefer direct agent invocation, not meta-delegation.
+
+  ———
+
+  V2 Architecture
+
+  The v2 architecture has five layers:
+
+  1. Orchestrator
+  2. Lane manager
+  3. Context knowledge system
+  4. Contract and validation system
+  5. Artifact and telemetry system
+
+  1. Orchestrator
+
+  The dispatcher remains the top-level owner of:
+
+  - pipeline state machine
+  - stage transitions
+  - cancellation
+  - cost tracking
+  - human gates
+  - resume and recovery
+
+  The current Dispatcher remains conceptually correct, but its invocation model changes. It
+  should no longer own one _pipeline_session_id. Instead it owns a lane registry.
+
+  Proposed internal components:
+
+  - Dispatcher
+  - LaneManager
+  - ContextManager
+  - ContractManager
+  - BudgetManager
+
+  2. Lane Manager
+
+  The lane manager provides scoped session continuity. Each lane is a named conversation domain
+  with its own session policy.
+
+  Lane types:
+
+  - bootstrap
+  - spec_author
+  - spec_review
+  - manifest_author
+  - manifest_review
+  - task_exec:<task_id>
+  - gap_analysis
+  - docs
+
+  Lane policy fields:
+
+  - lane_name
+  - session_id
+  - resume_enabled
+  - max_invocations_before_rotate
+  - context_artifacts
+  - allowed_stage_types
+  - budget_usd_cap
+  - rotation_strategy
+
+  Example lane map:
+
+  - intent_capture, planning, plan_fix -> spec_author
+  - plan_review -> spec_review
+  - task_breakdown, task_fix -> manifest_author
+  - task_review -> manifest_review
+  - task_execution, fix_iteration for task-001 -> task_exec:task-001
+  - gap_detection, gap_manifest_delta -> gap_analysis
+  - documentation -> docs
+
+  This gives continuity inside a contract family while avoiding cross-family contamination.
+
+  3. Context Knowledge System
+
+  The context system is the center of v2. It turns expensive project discovery into reusable
+  artifacts.
+
+  There are two context classes:
+
+  - stable project knowledge
+  - dynamic feature knowledge
+
+  Stable project knowledge changes rarely during a pipeline. Dynamic feature knowledge evolves
+  with the approved plan and completed work.
+
+  Artifacts:
+
+  - context/repo-inventory.yaml
+  - context/architecture-map.yaml
+  - context/conventions.yaml
+  - context/verification-catalog.yaml
+  - context/runtime-constraints.yaml
+  - context/feature-brief.yaml
+  - context/plan-packet-vN.yaml
+  - context/manifest-packet-vN.yaml
+  - context/task-packets/task-XXX.yaml
+  - context/gap-packet-vN.yaml
+
+  These are explicit inputs to lanes.
+
+  4. Contract and Validation System
+
+  The v2 contract system has three parts:
+
+  - canonical schemas in schemas.py
+  - prompt contract block generation
+  - validation repair loop
+
+  The key change is that prompts and agent contracts are no longer maintained manually in three
+  places. Agent .md files define role and method. Stage prompts define task-local instructions.
+  Contract blocks are generated from schemas plus semantic rules.
+
+  5. Artifact and Telemetry System
+
+  Artifact persistence remains a strength of v1 and should be preserved.
+
+  V2 adds:
+
+  - lane session records
+  - context artifact lineage
+  - validation failure snapshots
+  - budget checkpoints
+  - prompt/contract fingerprints
+
+  This makes failures diagnosable and makes determinism measurable.
+
+  ———
+
+  V2 Flow
+
+  The v2 flow is a 6-phase pipeline. Internally there are still stages, but they are grouped by
+  function rather than treated as one long chain of unrelated invocations.
+
+  Phase A: Bootstrap Knowledge
+
+  Purpose:
+  Create reusable project knowledge once.
+
+  Lane:
+  bootstrap
+
+  Inputs:
+
+  - feature request
+  - repository root
+
+  Outputs:
+
+  - feature-brief.yaml
+  - repo-inventory.yaml
+  - architecture-map.yaml
+  - conventions.yaml
+  - verification-catalog.yaml
+  - runtime-constraints.yaml
+
+  This phase replaces repeated “read the whole project again” behavior later.
+
+  Phase B: Specification Authoring
+
+  Purpose:
+  Create and refine executable specification.
+
+  Lanes:
+
+  - spec_author
+  - spec_review
+
+  Outputs:
+
+  - intent.yaml or merged feature brief if intent is retained
+  - plan-vN.yaml
+  - plan-review-vN.yaml
+  - plan-context-vN.yaml
+
+  The author lane can resume across plan draft and plan fix. The review lane is isolated.
+
+  Phase C: Execution Manifest Authoring
+
+  Purpose:
+  Translate approved plan into execution slices.
+
+  Lanes:
+
+  - manifest_author
+  - manifest_review
+
+  Inputs:
+
+  - plan
+  - stable context artifacts
+  - plan packet
+
+  Outputs:
+
+  - task-manifest-vN.yaml
+  - task-review-vN.yaml
+  - task-packets/task-XXX.yaml
+
+  The task packet is the main unit passed into execution lanes.
+
+  Phase D: Task Execution
+
+  Purpose:
+  Implement and verify tasks with per-task continuity.
+
+  Lanes:
+
+  - task_exec:<task_id>
+
+  Inputs:
+
+  - stable context
+  - task packet
+  - relevant review/fix findings
+
+  Outputs:
+
+  - execution result artifacts
+  - quality reports
+  - code review artifacts
+  - fix result artifacts
+
+  Each task gets its own lane. No task shares a session with another task.
+
+  Phase E: Gap Closure
+
+  Purpose:
+  Check spec coverage and generate only delta work.
+
+  Lane:
+  gap_analysis
+
+  Outputs:
+
+  - gap-report-vN.yaml
+  - gap-packet-vN.yaml
+  - task-manifest-delta-vN.yaml
+
+  This is a critical v2 change. Gap re-entry must produce deltas, not a second full manifest.
+
+  Phase F: Documentation and Finalization
+
+  Lane:
+  docs
+
+  Inputs:
+
+  - stable context
+  - completed tasks
+  - final gap status
+
+  Outputs:
+
+  - docs-report.yaml
+  - completion.yaml
+
+  ———
+
+  Context Artifact Specification
+
+  This is the heart of the design.
+
+  1. repo-inventory.yaml
+
+  Purpose:
+  Fast factual project orientation.
+
+  Fields:
+
+  - repo_name
+  - primary_languages
+  - package_managers
+  - build_systems
+  - test_frameworks
+  - lint_frameworks
+  - typecheck_frameworks
+  - ci_files
+  - entrypoints
+  - key_configs
+  - docs_roots
+  - source_roots
+  - test_roots
+  - deployment_artifacts
+  - common_commands
+
+  Example:
+
+  ---
+  type: repo_inventory
+  schema_version: "1.0"
+  repo_name: xpatcher
+  primary_languages: [python]
+  package_managers: [uv]
+  test_frameworks: [pytest]
+  lint_frameworks: [ruff]
+  typecheck_frameworks: []
+  source_roots:
+    - src/
+  test_roots:
+    - tests/
+  key_configs:
+    - pyproject.toml
+    - config.yaml
+  common_commands:
+    test:
+      - pytest -q
+    lint:
+      - ruff check .
+
+  2. architecture-map.yaml
+
+  Purpose:
+  Share structural understanding once.
+
+  Fields:
+
+  - subsystems
+  - major_paths
+  - dependency_edges
+  - runtime_flow
+  - extension_points
+  - risk_hotspots
+
+  This should be concise, not a prose essay.
+
+  3. conventions.yaml
+
+  Purpose:
+  Avoid repeated style and repo pattern rediscovery.
+
+  Fields:
+
+  - file_naming_patterns
+  - test_location_rules
+  - config_patterns
+  - CLI patterns
+  - commit_message_pattern
+  - review_expectations
+
+  4. verification-catalog.yaml
+
+  Purpose:
+  Provide known-good executable verification commands.
+
+  Fields:
+
+  - command_groups
+  - prerequisites
+  - reliable_smoke_tests
+  - flaky_or_expensive_commands
+  - command_scope_map
+
+  This artifact should be reused by planning, manifest creation, and reviewer stages.
+
+  5. feature-brief.yaml
+
+  Purpose:
+  Normalize the request and bind it to project knowledge.
+
+  Fields:
+
+  - goal
+  - scope
+  - non_goals
+  - constraints
+  - ambiguity_flags
+  - project_relevance
+  - likely_subsystems
+
+  6. plan-packet-vN.yaml
+
+  Purpose:
+  Bridge stable context into plan authoring and manifest authoring.
+
+  Fields:
+
+  - feature_brief_ref
+  - stable_context_refs
+  - subsystem_targets
+  - verification_catalog_refs
+  - planning_assumptions
+  - open_questions
+  - suggested_checks
+
+  7. manifest-packet-vN.yaml
+
+  Purpose:
+  Bridge approved plan into task breakdown deterministically.
+
+  Fields:
+
+  - plan_ref
+  - plan_summary
+  - affected_subsystems
+  - execution_constraints
+  - suggested_task_boundaries
+  - known_verification_commands
+  - decomposition_rules
+
+  8. task-packets/task-XXX.yaml
+
+  Purpose:
+  This is the unit of execution.
+
+  Fields:
+
+  - task_id
+  - title
+  - objective
+  - rationale
+  - files_in_scope
+  - likely_related_files
+  - constraints
+  - dependency_context
+  - exact_acceptance_criteria
+  - verification_commands
+  - coding_conventions
+  - relevant_architecture_notes
+  - risk_notes
+
+  This packet should be the only task-specific artifact an execution lane must read first.
+
+  9. gap-packet-vN.yaml
+
+  Purpose:
+  Translate gap report into delta work.
+
+  Fields:
+
+  - gap_report_ref
+  - unresolved_gaps
+  - affected_tasks
+  - missing_capabilities
+  - candidate_delta_tasks
+  - required_review_scope
+
+  ———
+
+  Lane Design
+
+  Each lane has three responsibilities:
+
+  - maintain narrow continuity
+  - consume approved context artifacts
+  - produce one artifact family only
+
+  Lane: bootstrap
+
+  Produces:
+  stable project context
+
+  Session policy:
+  single session, rotate only if bootstrap becomes unusually long
+
+  Why continuity helps:
+  the agent is building a coherent project map
+
+  Why isolation matters:
+  this lane should not pollute planning or execution
+
+  Lane: spec_author
+
+  Produces:
+  intent, plan, plan fix
+
+  Session policy:
+  resume across plan author/fix iterations only
+
+  Why continuity helps:
+  the planner remembers design tradeoffs and prior fixes
+
+  Why isolation matters:
+  must not contaminate task manifest or code review stages
+
+  Lane: spec_review
+
+  Produces:
+  plan review only
+
+  Session policy:
+  resume inside plan review loop optionally, but isolated from spec author
+
+  Why:
+  review independence matters more than continuity
+
+  Lane: manifest_author
+
+  Produces:
+  task manifest and manifest fixes
+
+  Session policy:
+  resume only inside manifest authoring family
+
+  Why:
+  task decomposition has its own contract and should not inherit plan output bias
+
+  Lane: manifest_review
+
+  Produces:
+  manifest review only
+
+  Same rationale as spec review
+
+  Lane: task_exec:<task_id>
+
+  Produces:
+  execution and fix artifacts for one task
+
+  Session policy:
+  resume through implementation and fix iterations for that task only
+
+  Why:
+  continuity is highly valuable here
+
+  Lane: gap_analysis
+
+  Produces:
+  gap report and gap delta proposal
+
+  Session policy:
+  resume across gap analysis and delta materialization
+
+  Why:
+  the lane needs continuity around unresolved gaps, but must not inherit task execution chatter
+
+  Lane: docs
+
+  Produces:
+  docs report only
+
+  Session policy:
+  fresh or isolated short-lived
+
+  ———
+
+  Invocation Model
+
+  For v2, deterministic structured-output stages should use direct --agent.
+
+  The local CLI already supports:
+
+  - --agent
+  - --max-budget-usd
+
+  That means:
+
+  - stage prompts go directly to the intended role
+  - the stage prompt contract reaches the target agent
+  - there is no outer router burning cost and diluting the contract
+
+  Recommended direct-invocation stages:
+
+  - bootstrap
+  - spec author
+  - spec review
+  - manifest author
+  - manifest review
+  - gap analysis
+  - docs
+
+  Execution lanes can also use direct --agent executor.
+
+  No stage prompt should say “delegate this task to @agent-X”. That is v1 leakage.
+
+  ———
+
+  Prompt Model
+
+  Agent .md files should define:
+
+  - role
+  - decision criteria
+  - quality bar
+  - tool strategy
+  - refusal boundaries
+
+  Stage prompts should define:
+
+  - artifact inputs
+  - requested output file
+  - contract block
+  - budget
+  - time limit
+  - lane-local instructions
+
+  PromptBuilder v2 should build packets, not giant repeated instructions.
+
+  Example shape for manifest author:
+
+  - read manifest-packet-v3.yaml
+  - read plan-v3.yaml
+  - write task-manifest.yaml
+  - contract block for TaskManifestOutput
+  - semantic invariants:
+      - every task must have one must_pass command criterion
+      - quality_tier must be one of lite|standard|thorough
+      - output only YAML
+
+  That is far cleaner than duplicating schema hints in both prompt and agent markdown.
+
+  ———
+
+  Contract Model
+
+  schemas.py remains canonical.
+
+  A new ContractManager should export two things:
+
+  1. field contract block
+  2. semantic rules block
+
+  Example generated contract block for TaskManifestOutput:
+
+  type: task_manifest
+  plan_version: integer >= 1
+  summary: string min_length=10
+  tasks:
+    - id: pattern ^task-[A-Z]?\d{3}$
+      title: string min_length=5
+      description: string min_length=10
+      rationale: string
+      files_in_scope: list[string]
+      acceptance_criteria:
+        - id: string min_length=3
+          description: string min_length=10
+          verification: command | review
+          command: string
+          severity: must_pass | should_pass | nice_to_have
+      depends_on: list[string]
+      estimated_complexity: low | medium | high
+      quality_tier: lite | standard | thorough
+
+  Semantic rules block:
+
+  - every task must include at least one must_pass criterion using verification: command
+  - every command criterion must contain a concrete executable command
+  - task IDs must be unique
+  - do not output prose outside YAML
+
+  This replaces fragile hand-maintained prompt hints.
+
+  ———
+
+  Validation and Recovery
+
+  Validation retry must be first-class in v2.
+
+  For every validated stage:
+
+  1. invoke lane agent
+  2. read artifact
+  3. validate against schema and semantics
+  4. if invalid:
+      - persist invalid output snapshot
+      - generate targeted repair prompt
+      - retry in same lane if same contract family
+      - retry in fresh lane session if contamination suspected
+  5. fail only after bounded retries
+
+  Retry strategy:
+
+  - first retry: same lane session, targeted repair prompt
+  - second retry: rotate session inside same lane, same contract block
+  - final failure: pipeline blocked or failed depending on stage criticality
+
+  This specifically addresses the quality_tier: production class of failure.
+
+  ———
+
+  Normalizer Policy
+
+  The current normalizer is useful but too permissive.
+
+  V2 should divide normalization into three classes:
+
+  - safe normalization
+  - compatibility aliases
+  - masked contract violations
+
+  Safe normalization:
+
+  - null to empty string
+  - risk -> description
+  - complexity -> estimated_complexity
+
+  Compatibility aliases:
+
+  - production -> thorough
+  - approve -> approved
+
+  Masked violations:
+
+  - inventing missing summaries
+  - defaulting required strategic fields too aggressively
+  - over-coercing structure that should fail visibly
+
+  Policy:
+
+  - safe normalization allowed by default
+  - compatibility aliases allowed with warning metadata
+  - masked violations disabled for deterministic stages
+
+  Every normalization event should be traceable in validation metadata.
+
+  ———
+
+  Review Loop Policy
+
+  V2 review loops should be severity-gated.
+
+  Rules:
+
+  - approved => continue
+  - needs_changes with any critical|major => fix loop
+  - needs_changes with only minor|nit => auto-approve with warnings recorded
+  - rejected => block unless automatic retry explicitly allowed
+
+  This should apply to:
+
+  - plan review
+  - task manifest review
+  - per-task code review if appropriate
+
+  This cuts unnecessary pre-execution churn.
+
+  ———
+
+  Gap Handling Model
+
+  Current gap handling reruns generic task breakdown and filters by task ID. That is not
+  acceptable for v2.
+
+  V2 gap flow:
+
+  1. gap lane emits GapOutput
+  2. if complete => continue
+  3. if gaps found:
+      - build gap-packet-vN.yaml
+      - invoke a dedicated gap-to-delta breakdown step
+      - produce task-manifest-delta-vN.yaml
+      - validate that every delta task maps to at least one unresolved gap
+  4. review only the delta
+  5. merge delta into master manifest
+  6. execute only delta tasks
+
+  No full manifest re-synthesis during gap re-entry.
+
+  ———
+
+  Budget and Cost Controls
+
+  V2 should add explicit budgets.
+
+  Budget scopes:
+
+  - per lane
+  - per stage family
+  - pre-execution total
+  - per task execution lane
+  - total pipeline
+
+  Suggested defaults:
+
+  - bootstrap cap
+  - spec authoring cap
+  - manifest authoring cap
+  - per review loop cap
+  - per task cap
+  - total cap
+
+  Budget behavior:
+
+  - warn at 70%
+  - tighten retry policy at 85%
+  - block or request human intervention at 100%
+
+  The CLI supports --max-budget-usd; use it per invocation plus dispatcher-side aggregate
+  accounting.
+
+  ———
+
+  State Model Changes
+
+  Current pipeline state machine is fundamentally fine. Preserve it.
+
+  Add new state fields:
+
+  - lane_sessions
+  - context_versions
+  - contract_versions
+  - normalization_events
+  - budget_checkpoints
+  - validation_failures
+
+  Suggested pipeline-state.yaml additions:
+
+  lane_sessions:
+    spec_author:
+      session_id: ...
+      invocations: 3
+      rotated_at: null
+    manifest_author:
+      session_id: ...
+      invocations: 2
+  context_versions:
+    repo_inventory: 1
+    architecture_map: 1
+    plan_packet: 3
+  budget_checkpoints:
+    bootstrap_usd: 0.41
+    pre_execution_usd: 1.82
+
+  ———
+
+  File Layout Changes
+
+  Add:
+
+  - context/
+  - validation-failures/
+  - lanes/
+
+  Example:
+
+  feature-dir/
+    context/
+      repo-inventory.yaml
+      architecture-map.yaml
+      conventions.yaml
+      verification-catalog.yaml
+      feature-brief.yaml
+      plan-packet-v1.yaml
+      manifest-packet-v2.yaml
+      gap-packet-v1.yaml
+      task-packets/
+        task-001.yaml
+    validation-failures/
+      task_breakdown-attempt-1.yaml
+      task_breakdown-attempt-1-errors.yaml
+    lanes/
+      lane-spec_author.yaml
+      lane-manifest_author.yaml
+      lane-task_exec-task-001.yaml
+
+  ———
+
+  Implementation Plan: v1 to v2
+
+  Phase 0: Immediate hardening
+
+  Goal:
+  Prevent the exact failures now.
+
+  Changes:
+
+  - add quality_tier aliases
+  - add task manifest contract guidance to planner or split planner instructions
+  - wire validation retry into _invoke_validated_stage()
+  - validate executor fix outputs, do not ignore them
+
+  No architectural disruption yet.
+
+  Phase 1: Introduce lane manager without changing stage semantics
+
+  Goal:
+  Keep current stage structure but replace global session with lane sessions.
+
+  Changes:
+
+  - add LaneManager
+  - replace _pipeline_session_id with lane lookup
+  - map stages to lanes
+  - persist lane sessions in state
+
+  Behavior:
+  Same pipeline, better session isolation.
+
+  Phase 2: Introduce context artifacts
+
+  Goal:
+  Stop repeated rediscovery.
+
+  Changes:
+
+  - add bootstrap phase or bootstrap substage before planning
+  - generate stable context artifacts
+  - update prompt builder to reference context artifacts
+  - build task packets during manifest materialization
+
+  Behavior:
+  Lower token cost, more explicit context reuse.
+
+  Phase 3: Switch deterministic stages to direct --agent
+
+  Goal:
+  remove routing prompts and send contracts directly to the target role.
+
+  Changes:
+
+  - extend AgentInvocation with agent and budget cap
+  - update _build_cmd() to use --agent and --max-budget-usd
+  - strip “delegate to @agent-X” from prompts
+  - keep agent markdown focused on role only
+
+  Behavior:
+  less cost, stronger contract fidelity
+
+  Phase 4: Contract manager and prompt contract generation
+
+  Goal:
+  eliminate schema drift
+
+  Changes:
+
+  - add ContractManager
+  - generate prompt contract blocks from schemas and semantic constraints
+  - reduce manual schema duplication in prompts and .md
+
+  Behavior:
+  fewer invalid outputs, easier maintenance
+
+  Phase 5: Review severity gating and budget enforcement
+
+  Goal:
+  cut waste
+
+  Changes:
+
+  - auto-approve minor-only review outputs
+  - per-lane and pre-execution budget limits
+  - better escalation messages
+
+  Phase 6: Gap delta redesign
+
+  Goal:
+  fix re-entry determinism
+
+  Changes:
+
+  - add gap packet
+  - add delta manifest artifact
+  - add merge policy for delta tasks
+  - remove full re-breakdown from gap flow
+
+  Phase 7: Optional simplification
+
+  Goal:
+  reduce stage count only after architecture is stable
+
+  Possible later changes:
+
+  - merge intent into feature brief if it proves redundant
+  - merge some author/review preflight steps if telemetry shows no value
+
+  Do not do this before lanes and context artifacts are in place.
+
+  ———
+
+  Code-Level Design Changes
+
+  src/dispatcher/core.py
+
+  Replace:
+
+  - _pipeline_session_id
+  - _pipeline_session_used
+
+  with:
+
+  - self.lanes = LaneManager(...)
+
+  Update _invoke_stage() to:
+
+  - determine lane name
+  - resolve or create lane session
+  - apply per-lane budget
+  - invoke with direct agent if configured
+  - rotate lane session if needed
+
+  Add helpers:
+
+  - _lane_for_stage(stage, task_id)
+  - _build_repair_prompt(...)
+  - _invoke_validated_with_repair(...)
+  - _record_normalization_events(...)
+
+  src/dispatcher/session.py
+
+  Extend AgentInvocation:
+
+  - agent: str | None
+  - max_budget_usd: float | None
+  - maybe lane_name: str
+
+  Update _build_cmd():
+
+  - add --agent
+  - add --max-budget-usd
+
+  Keep session injection behavior, but now per lane.
+
+  src/context/builder.py
+
+  Refactor from template renderer to packet-aware prompt builder.
+
+  New methods:
+
+  - build_bootstrap_context(...)
+  - build_plan_packet(...)
+  - build_manifest_packet(...)
+  - build_task_packet(...)
+  - build_gap_packet(...)
+
+  Stage prompt builders should reference artifact paths rather than embedding repeated context
+  prose.
+
+  src/dispatcher/schemas.py
+
+  Keep canonical schemas.
+
+  Add:
+
+  - context artifact schemas
+  - delta manifest schema
+  - validation metadata model if useful
+
+  Reduce hidden coercion policy.
+
+  New modules
+
+  - src/dispatcher/lanes.py
+  - src/context/contracts.py
+  - src/context/packets.py
+  - src/dispatcher/budget.py
+
+  ———
+
+  Testing Strategy
+
+  Add tests in layers.
+
+  Unit
+
+  - stage-to-lane mapping
+  - lane rotation policy
+  - contract block generation
+  - validation repair prompt generation
+  - budget cutoff policy
+  - quality tier alias normalization
+  - minor-only review auto-approval
+
+  Integration
+
+  - planning and manifest authoring use different sessions
+  - task execution lane resumes across fix iterations
+  - lanes consume context artifacts instead of rereading repo wholesale
+  - invalid manifest output retries and succeeds
+  - gap delta path creates only new tasks
+
+  Regression
+
+  - current pipeline still works under v1 compatibility mode
+  - existing artifact store and state transitions remain valid
+
+  Golden tests
+
+  Create a small deterministic fixture repo and snapshot:
+
+  - context artifacts
+  - generated packets
+  - contract blocks
+  - lane state file evolution
+
+  ———
+
+  Compatibility Strategy
+
+  v2 should ship behind config flags first.
+
+  Suggested flags:
+
+  - pipeline.mode: v1 | v2
+  - sessions.use_lanes: true|false
+  - context.use_bootstrap_artifacts: true|false
+  - contracts.generated: true|false
+  - reviews.severity_gate: true|false
+  - gaps.delta_mode: true|false
+
+  Rollout order:
+
+  1. land v2 code paths behind flags
+  2. run shadow mode on real tasks
+  3. compare:
+      - cost
+      - validation failures
+      - stage retries
+      - time to first code line
+      - gap re-entry frequency
+  4. switch defaults only after parity or better
+
+  ———
+
+  Expected Outcomes
+
+  Compared to v1, v2 should produce:
+
+  - lower pre-execution cost
+  - fewer schema-failure deaths
+  - lower context contamination
+  - less repeated repo discovery
+  - narrower and more explainable retries
+  - more deterministic gap handling
+  - cleaner prompt/schema maintenance
+
+  The main design change is simple:
+
+  v1 stores knowledge in conversation history
+  v2 stores knowledge in explicit artifacts and uses lanes only for bounded continuity
+
+  That is the right architecture for a spec-driven pipeline.
+
+  If you want, next I can turn this into a concrete implementation backlog with file-by-file
+  changes, class interfaces, and rollout milestones for this repo.

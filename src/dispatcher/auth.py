@@ -1,12 +1,9 @@
-"""Authentication resolution for Claude Code CLI --bare invocations.
+"""Authentication resolution for xpatcher pipeline invocations.
 
-Claude Code ``--bare`` mode accepts only two auth mechanisms:
-``ANTHROPIC_API_KEY`` env var, or ``apiKeyHelper`` via ``--settings``.
-Keychain / OAuth reads are explicitly skipped.
-
-This module bridges the gap by resolving credentials from the user's
-environment and returning environment variables that ``subprocess``
-calls merge into the child process environment.
+xpatcher spawns ``claude`` as a subprocess.  This module resolves
+credentials from the user's environment and returns environment
+variables that the subprocess inherits, ensuring consistent auth
+regardless of how the CLI was launched.
 
 Resolution order
 ----------------
@@ -31,7 +28,7 @@ _SOURCE_OAUTH = "Claude subscription (OAuth)"
 
 
 def resolve_auth_env(xpatcher_home: Path) -> dict[str, str]:
-    """Return env-var overrides that authenticate ``claude --bare``.
+    """Return env-var overrides for subprocess authentication.
 
     The caller should merge the returned dict into the subprocess
     environment.  An empty dict means no extra variables are needed
@@ -100,6 +97,69 @@ def _load_api_key_from_dotenv(xpatcher_home: Path) -> str | None:
         return value or None
 
     return None
+
+
+def check_oauth_expiry(xpatcher_home: Path) -> dict | None:
+    """Check if the OAuth token is expired or expiring soon.
+
+    Returns None if no OAuth is in use, or a dict with:
+      expired: bool, minutes_remaining: int, needs_refresh: bool
+    """
+    # Skip if API key is configured (not using OAuth)
+    if _load_api_key_from_dotenv(xpatcher_home):
+        return None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+
+    raw = _load_oauth_raw()
+    if raw is None:
+        return None
+
+    expires_at = raw.get("expiresAt")
+    if not isinstance(expires_at, (int, float)):
+        return None
+
+    import time
+    now_ms = int(time.time() * 1000)
+    remaining_ms = expires_at - now_ms
+    minutes = remaining_ms / 1000 / 60
+    return {
+        "expired": remaining_ms <= 0,
+        "minutes_remaining": int(minutes),
+        "needs_refresh": minutes < 5,
+    }
+
+
+def _load_oauth_raw() -> dict | None:
+    """Load the raw OAuth credential dict (with expiresAt, refreshToken, etc)."""
+    if platform.system() == "Darwin":
+        return _oauth_raw_from_keychain()
+    return _oauth_raw_from_credentials_file()
+
+
+def _oauth_raw_from_keychain() -> dict | None:
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-s", _KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout.strip())
+        return data.get(_OAUTH_KEY) if isinstance(data, dict) else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _oauth_raw_from_credentials_file() -> dict | None:
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if not cred_path.is_file():
+        return None
+    try:
+        data = json.loads(cred_path.read_text())
+        return data.get(_OAUTH_KEY) if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _extract_oauth_access_token() -> str | None:

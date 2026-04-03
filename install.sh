@@ -132,30 +132,17 @@ chmod +x "$INSTALL_DIR/.claude-plugin/hooks/run_hook.sh"
 ok "Hook wrapper installed"
 
 # ---------------------------------------------------------------------------
-# 8. Bake agents.json for --bare mode (--bare skips plugin agent discovery)
+# 8. Verify plugin agents exist
 # ---------------------------------------------------------------------------
-"$INSTALL_DIR/.venv/bin/python" -c "
-import sys
-sys.path.insert(0, '$INSTALL_DIR')
-from pathlib import Path
-from src.dispatcher.session import bake_agents_json
-agents_dir = Path('$INSTALL_DIR/.claude-plugin/agents')
-output = Path('$INSTALL_DIR/.claude-plugin/agents.json')
-agents = bake_agents_json(agents_dir, output)
-print(f'{len(agents)} agents baked')
-for name in sorted(agents):
-    print(f'  {name}')
-" 2>&1
-
-BAKE_EXIT=$?
-if [ "$BAKE_EXIT" != "0" ]; then
-    err "Failed to bake agents.json"
+AGENT_COUNT=$(ls -1 "$INSTALL_DIR/.claude-plugin/agents/"*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "$AGENT_COUNT" -eq 0 ]; then
+    err "No agent definitions found in .claude-plugin/agents/"
     exit 1
 fi
-ok "agents.json generated"
+ok "$AGENT_COUNT agent definitions found"
 
 # ---------------------------------------------------------------------------
-# 9. Resolve authentication for --bare mode
+# 9. Resolve authentication
 # ---------------------------------------------------------------------------
 echo ""
 printf "${BOLD}${BLUE}  Authentication${RESET}\n"
@@ -198,17 +185,11 @@ fi
 echo ""
 printf "${BOLD}${BLUE}  Smoke Test${RESET}\n"
 
-# Read the baked agents JSON
-AGENTS_JSON=$(cat "$INSTALL_DIR/.claude-plugin/agents.json" 2>/dev/null)
-
 SMOKE_OUTPUT=""
 SMOKE_EXIT=0
-SMOKE_CMD=(claude --bare -p "respond with ok" --output-format json
+SMOKE_CMD=(claude -p "respond with ok" --output-format json
     --plugin-dir "$INSTALL_DIR/.claude-plugin/"
     --max-turns 1 --permission-mode bypassPermissions)
-if [ -n "$AGENTS_JSON" ]; then
-    SMOKE_CMD+=(--agents "$AGENTS_JSON")
-fi
 SMOKE_OUTPUT=$(${AUTH_ENV[@]+"${AUTH_ENV[@]}"} "${SMOKE_CMD[@]}" 2>&1) || SMOKE_EXIT=$?
 
 if [ "$SMOKE_EXIT" != "0" ]; then
@@ -255,13 +236,16 @@ if not plugin:
     print(f'WARNING: Plugin for path $INSTALL_DIR/.claude-plugin not found in loaded plugins: {plugins}')
     sys.exit(1)
 
-# plugin_record['name'] is the directory name (e.g. '.claude-plugin'), not the agent prefix.
-# Agents are baked with 'xpatcher:' prefix, so match on that directly.
-xp_agents = [a for a in agents if a.startswith('xpatcher:')]
-if len(xp_agents) < 9:
-    print(f'WARNING: Expected 9+ agents, found {len(xp_agents)}: {xp_agents}')
+# Agents are prefixed with the plugin directory name (e.g. '.claude-plugin:planner').
+# Match by suffix to be prefix-agnostic.
+required = {'planner', 'plan-reviewer', 'executor', 'reviewer', 'gap-detector', 'tech-writer', 'explorer'}
+found_bare = {a.split(':')[-1] for a in agents}
+missing = required - found_bare
+if missing:
+    print(f'WARNING: Missing agents: {missing}')
     sys.exit(1)
 
+xp_agents = [a for a in agents if a.split(':')[-1] in required]
 print(f'[ok] Claude Code CLI v{version} -- plugin loaded, {len(xp_agents)} agents registered')
 " 2>/dev/null; then
         :  # Success message already printed

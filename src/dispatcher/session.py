@@ -130,67 +130,36 @@ class SessionTailer:
         print(f"  {_DIM}{ts} {_CYAN}│{_RESET} {_DIM}{text}{_RESET}", file=sys.stderr, flush=True)
 
 
-# ── Agent JSON baking ────────────────────────────────────────────────────────
-
-# Fields from agent .md frontmatter that --agents JSON supports.
-# 'memory' is intentionally excluded — it silently breaks --agents parsing
-# in Claude Code CLI ≤2.1.89.
-_SUPPORTED_AGENT_FIELDS = frozenset({
-    "description", "model", "maxTurns", "tools",
-    "disallowedTools", "effort",
-})
+# ── Agent discovery ──────────────────────────────────────────────────────────
 
 
-def bake_agents_json(
-    agents_dir: Path,
-    output_path: Path,
-    plugin_name: str = "xpatcher",
-) -> dict[str, dict]:
-    """Parse agent .md files and write a --agents-compatible JSON file.
+def list_plugin_agents(agents_dir: Path) -> list[str]:
+    """Return agent names found in a plugin agents/ directory.
 
-    Returns the agents dict (keyed by ``plugin_name:agent_name``).
+    Reads the ``name`` field from each ``.md`` file's YAML frontmatter.
     """
-    agents: dict[str, dict] = {}
+    names: list[str] = []
     for md_file in sorted(agents_dir.glob("*.md")):
         text = md_file.read_text()
         parts = text.split("---", 2)
         if len(parts) < 3:
             continue
         meta = yaml.safe_load(parts[1])
-        if not isinstance(meta, dict):
-            continue
-        body = parts[2].strip()
-        name = meta.get("name", md_file.stem)
-        agent_def: dict = {
-            "description": str(meta.get("description", "")).strip(),
-            "prompt": body,
-        }
-        for key in _SUPPORTED_AGENT_FIELDS - {"description"}:
-            if key in meta:
-                agent_def[key] = meta[key]
-        agents[f"{plugin_name}:{name}"] = agent_def
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(agents))
-    return agents
+        if isinstance(meta, dict) and meta.get("name"):
+            names.append(meta["name"])
+    return names
 
 
 @dataclass
 class AgentInvocation:
-    """Parameters for a single Claude agent invocation."""
+    """Parameters for a single Claude CLI invocation."""
     prompt: str
-    agent: Optional[str] = None
     session_id: Optional[str] = None
     max_turns: Optional[int] = None
     timeout: int = 600
-    allowed_tools: Optional[list[str]] = None
-    disallowed_tools: Optional[list[str]] = None
-    model: Optional[str] = None
     permission_mode: str = "bypassPermissions"
     resume: bool = False
     cancel_check: Optional[Callable[[], bool]] = None
-    command_template: Optional[list[str]] = None
-    resume_args_template: Optional[list[str]] = None
     debug_tailer: Optional[SessionTailer] = None
 
 
@@ -226,14 +195,16 @@ class ClaudeSession:
     PLUGIN_NAME = "xpatcher"
     PREFLIGHT_TIMEOUT_SEC = 90
 
+    # Bare agent names (without plugin prefix).  Claude Code qualifies
+    # them with the plugin directory name at load time.
     REQUIRED_AGENTS = [
-        "xpatcher:planner",
-        "xpatcher:plan-reviewer",
-        "xpatcher:executor",
-        "xpatcher:reviewer",
-        "xpatcher:gap-detector",
-        "xpatcher:tech-writer",
-        "xpatcher:explorer",
+        "planner",
+        "plan-reviewer",
+        "executor",
+        "reviewer",
+        "gap-detector",
+        "tech-writer",
+        "explorer",
     ]
 
     def __init__(self, plugin_dir: Path, project_dir: Path, auth_env: dict[str, str] | None = None):
@@ -243,28 +214,19 @@ class ClaudeSession:
         self._auth_env = auth_env or {}
         self._xpatcher_home = plugin_dir.parent  # for re-resolving OAuth
         self._subprocess_env = build_subprocess_env(self._auth_env)
-        self._agents_json: str | None = None
-        agents_path = plugin_dir / "agents.json"
-        if agents_path.is_file():
-            raw = agents_path.read_text()
-            json.loads(raw)  # fail fast on corrupt file
-            self._agents_json = raw
 
-    def _required_agents(self, plugin_name: str | None = None) -> list[str]:
-        active_name = plugin_name or self.plugin_name or self.PLUGIN_NAME
-        return [agent.replace(f"{self.PLUGIN_NAME}:", f"{active_name}:") for agent in self.REQUIRED_AGENTS]
+    def _required_agents(self) -> list[str]:
+        return list(self.REQUIRED_AGENTS)
 
     def preflight(self) -> PreflightResult:
         """Verify Claude Code CLI is authenticated, responsive, and plugin loaded."""
         cmd = [
-            "claude", "--bare", "-p", "respond with ok",
+            "claude", "-p", "respond with ok",
             "--output-format", "json",
             "--plugin-dir", str(self.plugin_dir),
             "--max-turns", "1",
             "--permission-mode", "bypassPermissions",
         ]
-        if self._agents_json:
-            cmd.extend(["--agents", self._agents_json])
 
         try:
             result = subprocess.run(
@@ -330,7 +292,10 @@ class ClaudeSession:
         # so we keep self.plugin_name = PLUGIN_NAME for agent name construction.
 
         agents = init_event.get("agents", [])
-        missing = [a for a in self._required_agents() if a not in agents]
+        # Agents are qualified with the plugin dir name (e.g. ".claude-plugin:planner").
+        # Match by bare name suffix.
+        agent_bare_names = {a.split(":")[-1] for a in agents}
+        missing = [a for a in self._required_agents() if a not in agent_bare_names]
         if missing:
             return PreflightResult(
                 ok=False,
@@ -350,12 +315,9 @@ class ClaudeSession:
     def preview_cmd(self, invocation: AgentInvocation) -> str:
         """Return a human-readable command string for debug output.
 
-        Strips prompt text and agents JSON to keep the output scannable.
+        Strips prompt text to keep the output scannable.
         """
-        if invocation.command_template:
-            cmd = self._build_cmd_from_template(invocation)
-        else:
-            cmd = self._build_cmd_legacy(invocation)
+        cmd = self._build_cmd(invocation)
         sanitized = []
         skip_next = False
         for i, arg in enumerate(cmd):
@@ -366,77 +328,37 @@ class ClaudeSession:
                 sanitized.append(arg)
                 sanitized.append("'...'")
                 skip_next = True
-            elif arg == "--agents":
-                sanitized.append(arg)
-                sanitized.append("'{...}'")
-                skip_next = True
             else:
                 sanitized.append(arg)
         return " ".join(sanitized)
 
     def invoke(self, invocation: AgentInvocation) -> AgentResult:
-        """Invoke a Claude agent via CLI."""
-        if invocation.command_template:
-            cmd = self._build_cmd_from_template(invocation)
-        else:
-            cmd = self._build_cmd_legacy(invocation)
+        """Invoke the Claude CLI for one pipeline stage."""
+        cmd = self._build_cmd(invocation)
 
         # Inject pre-assigned session ID if set but not already a --resume
         if invocation.session_id and "--resume" not in cmd and "--session-id" not in cmd:
             cmd.extend(["--session-id", invocation.session_id])
 
-        # Inject project CLAUDE.md as system prompt context (--bare skips auto-discovery)
-        claude_md = self.project_dir / "CLAUDE.md"
-        if claude_md.is_file() and "--append-system-prompt-file" not in cmd:
-            cmd.extend(["--append-system-prompt-file", str(claude_md)])
-
         return self._run_cmd(cmd, invocation)
 
-    def _build_cmd_from_template(self, invocation: AgentInvocation) -> list[str]:
-        """Build command from config-driven template with placeholder substitution."""
-        subs = {
-            "{prompt}": invocation.prompt,
-            "{plugin_dir}": str(self.plugin_dir),
-            "{agents_json}": self._agents_json or "",
-        }
-        cmd = [subs.get(arg, arg) for arg in invocation.command_template]
-        # Drop --agents with empty value (happens when no agents.json exists)
-        try:
-            idx = cmd.index("--agents")
-            if idx + 1 < len(cmd) and cmd[idx + 1] == "":
-                del cmd[idx:idx + 2]
-        except ValueError:
-            pass
-        if invocation.resume and invocation.session_id and invocation.resume_args_template:
-            resume_subs = {"{session_id}": invocation.session_id}
-            cmd.extend(resume_subs.get(arg, arg) for arg in invocation.resume_args_template)
-        return cmd
+    def _build_cmd(self, invocation: AgentInvocation) -> list[str]:
+        """Build the CLI command for a pipeline stage invocation.
 
-    def _build_cmd_legacy(self, invocation: AgentInvocation) -> list[str]:
-        """Build command from individual AgentInvocation fields (backward compat)."""
+        Without ``--bare``, Claude Code natively discovers CLAUDE.md,
+        plugin agents, skills, and hooks from ``--plugin-dir``.  The
+        main agent delegates to subagents via the Agent tool.
+        """
         cmd = [
-            "claude", "--bare", "-p", invocation.prompt,
+            "claude", "-p", invocation.prompt,
             "--output-format", "json",
             "--plugin-dir", str(self.plugin_dir),
             "--permission-mode", invocation.permission_mode,
         ]
-        if self._agents_json:
-            cmd.extend(["--agents", self._agents_json])
-        if invocation.agent:
-            qualified = invocation.agent
-            if ":" not in qualified:
-                qualified = f"{self.plugin_name}:{qualified}"
-            cmd.extend(["--agent", qualified])
         if invocation.resume and invocation.session_id:
             cmd.extend(["--resume", invocation.session_id])
         if invocation.max_turns:
             cmd.extend(["--max-turns", str(invocation.max_turns)])
-        if invocation.model:
-            cmd.extend(["--model", invocation.model])
-        if invocation.allowed_tools:
-            cmd.extend(["--allowed-tools", ",".join(invocation.allowed_tools)])
-        if invocation.disallowed_tools:
-            cmd.extend(["--disallowed-tools", ",".join(invocation.disallowed_tools)])
         return cmd
 
     def _run_cmd(self, cmd: list[str], invocation: AgentInvocation) -> AgentResult:

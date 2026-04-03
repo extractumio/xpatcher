@@ -103,10 +103,46 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `PlanOutput` schema (Section 9 — Canonical Schema Reference).
-Task IDs use format `task-NNN` (zero-padded, e.g. `task-001`).
+Output must conform to the `PlanOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full PlanOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: plan
+summary: "A 20+ character summary of the plan's goal"   # REQUIRED string
+phases:
+  - id: phase-1
+    name: "Phase name"
+    description: "Phase description"
+    tasks:
+      - id: task-001
+        description: "At least 10 chars describing the task"
+        files:
+          - path/to/file.py
+        acceptance:                           # string or list of strings
+          - "Observable, testable criterion"
+        depends_on: []
+        estimated_complexity: medium          # low | medium | high
+        notes: "Single string, not a list"   # MUST be a string, default ""
+risks:
+  - description: "At least 10 chars describing the risk"   # field is 'description', NOT 'risk'
+    mitigation: "At least 10 chars describing mitigation"
+    severity: medium                                        # low | medium | high
+open_questions:
+  - "Question as a plain string"
+perspective_analysis:
+  security: "All analysis as a single string"     # MUST be string, NOT a list
+  backend: "All analysis as a single string"
+  frontend: "All analysis as a single string"
+```
+
+CRITICAL — these are the most common mistakes that cause validation failure:
+- `notes` MUST be a string, not a YAML list
+- Each risk MUST have a `description` field (not `risk` or `name`)
+- Each `perspective_analysis` value MUST be a string (not a YAML list)
+- `summary` is REQUIRED at the top level
+
+Task IDs use format `task-NNN` (zero-padded, e.g. `task-001`).
 
 ## Task Decomposition Rules
 

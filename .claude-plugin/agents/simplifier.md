@@ -64,10 +64,28 @@ You receive:
 Respond with a single YAML document. Start with --- on its own line.
 Do NOT wrap in ```yaml``` code blocks. Do NOT include prose before or after.
 
-Output must conform to the `SimplificationOutput` schema (Section 9 — Canonical Schema Reference).
-Type values: `dedup | flatten | extract | remove_dead | reuse_existing | constant`.
+Output must conform to the `SimplificationOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full SimplificationOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: simplification
+mode: dry_run                        # dry_run | apply (underscore, NOT hyphen)
+simplifications:
+  - file: src/example.py
+    line: 42                         # integer, default 0
+    type: dedup                      # dedup | flatten | extract | remove_dead | reuse_existing | constant
+    description: "What was simplified"
+    applied: false                   # boolean, default false
+lines_removed: 15                    # integer, default 0
+lines_added: 5                       # integer, default 0
+net_reduction: 10                    # integer, default 0
+```
+
+CRITICAL — common validation mistakes:
+- `mode` MUST be exactly `dry_run` or `apply` (NOT `dry-run`, `dryrun`, or `dryRun`)
+- `type` in simplifications MUST be one of: `dedup | flatten | extract | remove_dead | reuse_existing | constant` (lowercase, underscored)
+- Each simplification is an object with `file`, `type`, `description` (not a string)
 
 ## Constraints
 - Simplifications must be **behavior-preserving**. Do NOT change functionality.

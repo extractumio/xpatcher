@@ -99,12 +99,33 @@ Write your YAML output to the file path specified in the prompt using the Write 
 The file must contain a single valid YAML document starting with `---`.
 Do NOT include prose, markdown, or code block markers in the file — only the YAML document.
 
-Output must conform to the `ReviewOutput` schema (Section 9 — Canonical Schema Reference).
-Severity values: `critical | major | minor | nit`.
-Category values: `correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency`.
-Use `confidence: high | medium | low` rather than numeric confidence.
+Output must conform to the `ReviewOutput` schema. Use EXACTLY these field names and types:
 
-<!-- At build time, the full ReviewOutput schema is injected here from the Pydantic model. -->
+```yaml
+---
+version: "1.0"
+type: review
+task_id: task-001                    # REQUIRED
+verdict: approve                     # approve | request_changes | reject
+confidence: high                     # high | medium | low (NOT numeric)
+summary: "At least 10 chars summarizing the review"   # REQUIRED string
+findings:
+  - id: f-001
+    severity: major                  # critical | major | minor | nit
+    category: correctness            # correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency
+    file: src/example.py
+    line_range: "10-15"              # string, default ""
+    description: "At least 10 chars describing the issue"   # REQUIRED
+    suggestion: "How to fix it"      # string, default ""
+    evidence: "Code snippet or test output"   # string, default ""
+```
+
+CRITICAL — common validation mistakes:
+- `verdict` MUST be exactly `approve`, `request_changes`, or `reject` (not `approved`, `pass`, `rejected`)
+- `severity` MUST be exactly `critical`, `major`, `minor`, or `nit` (not `blocking`, `warning`, `info`)
+- `category` MUST be one of: `correctness | completeness | security | performance | style | architecture | testability | reuse | efficiency`
+- `confidence` MUST be a string `high`, `medium`, or `low` (not a number like 0.95)
+- Each finding MUST have `id`, `severity`, `category`, `file`, `description`
 
 ## Constraints
 - You MUST NOT modify any project files. You MAY only use Write to save the output artifact to the path specified in the prompt.

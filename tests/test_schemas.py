@@ -202,3 +202,101 @@ class TestValidatorRouting:
         )
         assert result.valid is True
         assert result.data["phases"][0]["tasks"][0]["acceptance"][1] == "exclaim signature: str) -> str"
+
+    def test_validator_normalizes_plan_risk_key_to_description(self):
+        validator = ArtifactValidator()
+        result = validator.validate_data(
+            {
+                "type": "plan",
+                "summary": "Plan with risk using wrong field name",
+                "phases": [
+                    {
+                        "id": "phase-1",
+                        "name": "Phase One",
+                        "description": "Implement the feature",
+                        "tasks": [
+                            {
+                                "id": "task-001",
+                                "description": "Implement the feature end to end",
+                                "acceptance": "Tests pass",
+                                "estimated_complexity": "low",
+                            }
+                        ],
+                    }
+                ],
+                "risks": [
+                    {
+                        "risk": "SQLite WAL journal mode may cause issues under Docker volume mounts",
+                        "mitigation": "Document WAL mode behavior and recommend host-native DB path",
+                        "severity": "medium",
+                    }
+                ],
+            },
+            expected_type="plan",
+        )
+        assert result.valid is True
+        assert "SQLite WAL" in result.data["risks"][0]["description"]
+
+    def test_validator_normalizes_plan_notes_list_to_string(self):
+        validator = ArtifactValidator()
+        result = validator.validate_data(
+            {
+                "type": "plan",
+                "summary": "Plan with task notes as a list instead of string",
+                "phases": [
+                    {
+                        "id": "phase-1",
+                        "name": "Phase One",
+                        "description": "Implement the feature",
+                        "tasks": [
+                            {
+                                "id": "task-001",
+                                "description": "Implement the feature end to end",
+                                "acceptance": "Tests pass",
+                                "estimated_complexity": "low",
+                                "notes": [
+                                    "The catch-all SPA route must exclude /api/*",
+                                    "CORS origins must be configurable",
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            expected_type="plan",
+        )
+        assert result.valid is True
+        assert isinstance(result.data["phases"][0]["tasks"][0]["notes"], str)
+        assert "catch-all SPA" in result.data["phases"][0]["tasks"][0]["notes"]
+
+    def test_validator_normalizes_perspective_analysis_lists_to_strings(self):
+        validator = ArtifactValidator()
+        result = validator.validate_data(
+            {
+                "type": "plan",
+                "summary": "Plan with perspective analysis as lists",
+                "phases": [
+                    {
+                        "id": "phase-1",
+                        "name": "Phase One",
+                        "description": "Implement the feature",
+                        "tasks": [
+                            {
+                                "id": "task-001",
+                                "description": "Implement the feature end to end",
+                                "acceptance": "Tests pass",
+                                "estimated_complexity": "low",
+                            }
+                        ],
+                    }
+                ],
+                "perspective_analysis": {
+                    "security": ["Container runs as non-root", "No secrets in image"],
+                    "backend": ["CORS origins configurable", "Directory structure preserved"],
+                },
+            },
+            expected_type="plan",
+        )
+        assert result.valid is True
+        assert isinstance(result.data["perspective_analysis"]["security"], str)
+        assert "non-root" in result.data["perspective_analysis"]["security"]

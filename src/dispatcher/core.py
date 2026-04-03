@@ -228,7 +228,20 @@ class Dispatcher:
         except KeyboardInterrupt:
             self._handle_interrupt(sm, pipeline_id)
 
-    def resume(self, pipeline_id: str):
+    # Stages that --from-stage accepts, mapped to the pipeline method entry points
+    _RESUMABLE_STAGES = {
+        "intent_capture": 1,
+        "planning": 2,
+        "plan_review": 3,
+        "plan_approval": 5,
+        "task_breakdown": 6,
+        "task_execution": 9,
+        "gap_detection": 14,
+        "documentation": 15,
+        "completion": 16,
+    }
+
+    def resume(self, pipeline_id: str, from_stage: str | None = None, debug: bool = False):
         record = _find_pipeline_record(self.xpatcher_home, pipeline_id)
         if record is None:
             self.tui.error(f"Unknown pipeline: {pipeline_id}")
@@ -243,6 +256,7 @@ class Dispatcher:
         self.total_cost_usd = self.state_file.read().get("total_cost_usd", 0.0)
         self._pipeline_session_id = str(uuid.uuid4())
         self._pipeline_session_used = False
+        self.debug = debug
 
         state = self.state_file.read()
         current = PipelineStage(state.get("current_stage", PipelineStage.UNINITIALIZED.value))
@@ -251,6 +265,11 @@ class Dispatcher:
         self._require_auth()
 
         try:
+            # --from-stage: jump to a specific stage using existing artifacts
+            if from_stage:
+                self._resume_from_stage(from_stage, feature_dir, config, state)
+                return
+
             if gate_reason == "plan_approval" and current in {PipelineStage.PAUSED, PipelineStage.PLAN_APPROVAL}:
                 sm = PipelineStateMachine(self.state_file)
                 store = ArtifactStore(feature_dir)
@@ -276,9 +295,8 @@ class Dispatcher:
                 sm.transition(PipelineStage.DOCUMENTATION)
                 self.tui.stage("Stage 15: Documentation")
                 docs_out = self.feature_dir / "docs-report.yaml"
-                _, validation = self._invoke_validated_agent(
-                    agent="tech-writer",
-                    prompt=prompt_builder.build_tech_writer(docs_out, self._agent_timeout(config, "tech-writer")),
+                _, validation = self._invoke_validated_stage(
+                    prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
                     config=config,
                     expected_type="docs_report",
                     stage=PipelineStage.DOCUMENTATION.value,
@@ -297,14 +315,186 @@ class Dispatcher:
                 return
 
             self.tui.info(
-                "Resume supports paused human gates. For execution-stage recovery, use "
-                "`status`, `skip`, `cancel`, or rerun once the pipeline is unblocked."
+                "Resume supports paused human gates and --from-stage for stage-level recovery.\n"
+                f"  Available stages: {', '.join(self._RESUMABLE_STAGES)}\n"
+                "  Example: xpatcher resume <id> --from-stage plan_review"
             )
         except CancelledPipelineError:
             self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
         except KeyboardInterrupt:
             sm = PipelineStateMachine(self.state_file)
             self._handle_interrupt(sm, pipeline_id)
+
+    def _resume_from_stage(self, from_stage: str, feature_dir: Path, config: dict, state: dict):
+        """Resume pipeline execution from a specific stage, reusing existing artifacts."""
+        if from_stage not in self._RESUMABLE_STAGES:
+            self.tui.error(f"Unknown stage: {from_stage}")
+            self.tui.info(f"Available stages: {', '.join(self._RESUMABLE_STAGES)}")
+            return
+
+        target = PipelineStage(from_stage)
+        sm = PipelineStateMachine(self.state_file)
+        store = ArtifactStore(feature_dir)
+        prompt_builder = PromptBuilder(feature_dir, self.project_dir)
+        description = state.get("description", "")
+
+        # Validate required artifacts exist for the target stage
+        missing = self._check_stage_prerequisites(target, store)
+        if missing:
+            self.tui.error(f"Cannot resume from {from_stage} — missing artifacts:")
+            for m in missing:
+                self.tui.error(f"  - {m}")
+            return
+
+        # Force state to PAUSED so we can transition to any stage
+        current = PipelineStage(state.get("current_stage", PipelineStage.UNINITIALIZED.value))
+        if current != PipelineStage.PAUSED:
+            sm.transition(PipelineStage.PAUSED)
+
+        self._update_status(status="running", gate_reason="")
+        stage_num = self._RESUMABLE_STAGES[from_stage]
+        self.tui.info(f"Resuming from Stage {stage_num}: {from_stage}")
+
+        plan_version = store.latest_version("plan") or 1
+        manifest_version = max(1, store.latest_version("task-manifest"))
+
+        if target == PipelineStage.INTENT_CAPTURE:
+            sm.transition(PipelineStage.INTENT_CAPTURE)
+            self._run_pipeline(sm, store, prompt_builder, config, description, verbose=False, debug=self.debug)
+
+        elif target == PipelineStage.PLANNING:
+            sm.transition(PipelineStage.PLANNING)
+            self.tui.stage("Stage 2: Planning")
+            next_version = plan_version + 1
+            plan_path = self.feature_dir / f"plan-v{next_version}.yaml"
+            _, validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_planner(plan_path, self._stage_timeout(config)),
+                config=config,
+                expected_type="plan",
+                stage=PipelineStage.PLANNING.value,
+                output_path=plan_path,
+            )
+            if not validation.valid:
+                self._fail_pipeline(sm, f"Plan validation failed: {validation.errors}")
+                return
+            store.save(f"plan-v{next_version}.yaml", validation.data)
+            plan_version = self._run_plan_review_loop(sm, store, prompt_builder, config, starting_version=next_version)
+            if plan_version is None:
+                return
+            self._continue_from_plan_approved(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.PLAN_REVIEW:
+            plan_version = self._run_plan_review_loop(sm, store, prompt_builder, config, starting_version=plan_version)
+            if plan_version is None:
+                return
+            self._continue_from_plan_approved(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.PLAN_APPROVAL:
+            self._continue_from_plan_approved(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.TASK_BREAKDOWN:
+            manifest_version = self._run_task_breakdown_and_review(
+                sm, store, prompt_builder, config,
+                plan_version=plan_version,
+                manifest_version=manifest_version,
+            )
+            if manifest_version is None:
+                return
+            if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
+                return
+            self._continue_from_gap_detection(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.TASK_EXECUTION:
+            if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
+                return
+            self._continue_from_gap_detection(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.GAP_DETECTION:
+            self._continue_from_gap_detection(sm, store, prompt_builder, config, plan_version)
+
+        elif target == PipelineStage.DOCUMENTATION:
+            sm.transition(PipelineStage.DOCUMENTATION)
+            self.tui.stage("Stage 15: Documentation")
+            docs_out = self.feature_dir / "docs-report.yaml"
+            _, validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
+                config=config,
+                expected_type="docs_report",
+                stage=PipelineStage.DOCUMENTATION.value,
+                output_path=docs_out,
+            )
+            if not validation.valid:
+                self._fail_pipeline(sm, f"Docs validation failed: {validation.errors}")
+                return
+            store.save("docs-report.yaml", validation.data)
+            sm.transition(PipelineStage.COMPLETION)
+            self._handle_completion_gate(sm, store, transition_stage=False)
+
+        elif target == PipelineStage.COMPLETION:
+            sm.transition(PipelineStage.COMPLETION)
+            self._handle_completion_gate(sm, store, transition_stage=False)
+
+    def _continue_from_plan_approved(self, sm, store, prompt_builder, config, plan_version):
+        """Continue pipeline from after plan approval through to completion."""
+        if not self._handle_plan_approval(sm, store, prompt_builder, config, plan_version=plan_version):
+            return
+        manifest_version = self._run_task_breakdown_and_review(
+            sm, store, prompt_builder, config,
+            plan_version=plan_version,
+            manifest_version=max(1, store.latest_version("task-manifest")),
+        )
+        if manifest_version is None:
+            return
+        if not self._run_prioritization_and_execution(sm, store, prompt_builder, config):
+            return
+        self._continue_from_gap_detection(sm, store, prompt_builder, config, plan_version)
+
+    def _continue_from_gap_detection(self, sm, store, prompt_builder, config, plan_version):
+        """Continue pipeline from gap detection through to completion."""
+        if not self._run_gap_detection_with_reentry(sm, store, prompt_builder, config, plan_version):
+            return
+        sm.transition(PipelineStage.DOCUMENTATION)
+        self.tui.stage("Stage 15: Documentation")
+        docs_out = self.feature_dir / "docs-report.yaml"
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
+            config=config,
+            expected_type="docs_report",
+            stage=PipelineStage.DOCUMENTATION.value,
+            output_path=docs_out,
+        )
+        if not validation.valid:
+            self._fail_pipeline(sm, f"Docs validation failed: {validation.errors}")
+            return
+        store.save("docs-report.yaml", validation.data)
+        sm.transition(PipelineStage.COMPLETION)
+        self._handle_completion_gate(sm, store, transition_stage=False)
+
+    def _check_stage_prerequisites(self, target: PipelineStage, store: ArtifactStore) -> list[str]:
+        """Check that required artifacts exist for resuming from a given stage."""
+        missing = []
+        intent_required = {
+            PipelineStage.PLANNING, PipelineStage.PLAN_REVIEW, PipelineStage.PLAN_APPROVAL,
+            PipelineStage.TASK_BREAKDOWN, PipelineStage.TASK_EXECUTION,
+            PipelineStage.GAP_DETECTION, PipelineStage.DOCUMENTATION,
+        }
+        plan_required = {
+            PipelineStage.PLAN_REVIEW, PipelineStage.PLAN_APPROVAL,
+            PipelineStage.TASK_BREAKDOWN, PipelineStage.TASK_EXECUTION,
+            PipelineStage.GAP_DETECTION, PipelineStage.DOCUMENTATION,
+        }
+        manifest_required = {
+            PipelineStage.TASK_EXECUTION, PipelineStage.GAP_DETECTION,
+            PipelineStage.DOCUMENTATION,
+        }
+
+        if target in intent_required and not (self.feature_dir / "intent.yaml").exists():
+            missing.append("intent.yaml")
+        if target in plan_required and store.latest_version("plan") == 0:
+            missing.append("plan-v*.yaml")
+        if target in manifest_required and not (self.feature_dir / "task-manifest.yaml").exists():
+            missing.append("task-manifest.yaml")
+        return missing
 
     def _run_pipeline(
         self,
@@ -324,9 +514,8 @@ class Dispatcher:
         self._update_status(status="running")
         self.tui.stage("Stage 1: Intent Capture")
         intent_path = self.feature_dir / "intent.yaml"
-        _, validation = self._invoke_validated_agent(
-            agent="planner",
-            prompt=prompt_builder.build_intent_capture(description, intent_path, self._agent_timeout(config, "planner")),
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_intent_capture(description, intent_path, self._stage_timeout(config)),
             config=config,
             expected_type="intent",
             stage=PipelineStage.INTENT_CAPTURE.value,
@@ -340,9 +529,8 @@ class Dispatcher:
         sm.transition(PipelineStage.PLANNING)
         self.tui.stage("Stage 2: Planning")
         plan_v1_path = self.feature_dir / "plan-v1.yaml"
-        _, validation = self._invoke_validated_agent(
-            agent="planner",
-            prompt=prompt_builder.build_planner(plan_v1_path, self._agent_timeout(config, "planner")),
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_planner(plan_v1_path, self._stage_timeout(config)),
             config=config,
             expected_type="plan",
             stage=PipelineStage.PLANNING.value,
@@ -380,9 +568,8 @@ class Dispatcher:
         sm.transition(PipelineStage.DOCUMENTATION)
         self.tui.stage("Stage 15: Documentation")
         docs_out = self.feature_dir / "docs-report.yaml"
-        _, validation = self._invoke_validated_agent(
-            agent="tech-writer",
-            prompt=prompt_builder.build_tech_writer(docs_out, self._agent_timeout(config, "tech-writer")),
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_tech_writer(docs_out, self._stage_timeout(config)),
             config=config,
             expected_type="docs_report",
             stage=PipelineStage.DOCUMENTATION.value,
@@ -412,9 +599,8 @@ class Dispatcher:
             sm.transition(PipelineStage.PLAN_REVIEW)
             self.tui.stage(f"Stage 3: Plan Review (iteration {iteration})")
             review_out = self.feature_dir / f"plan-review-v{plan_version}.yaml"
-            _, validation = self._invoke_validated_agent(
-                agent="plan-reviewer",
-                prompt=prompt_builder.build_plan_reviewer(plan_version, review_out, self._agent_timeout(config, "plan-reviewer")),
+            _, validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_plan_reviewer(plan_version, review_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="plan_review",
                 stage=PipelineStage.PLAN_REVIEW.value,
@@ -440,9 +626,8 @@ class Dispatcher:
             self.tui.stage("Stage 4: Plan Fix")
             plan_version += 1
             plan_fix_out = self.feature_dir / f"plan-v{plan_version}.yaml"
-            _, plan_validation = self._invoke_validated_agent(
-                agent="planner",
-                prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out, self._agent_timeout(config, "planner")),
+            _, plan_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="plan",
                 stage=PipelineStage.PLAN_FIX.value,
@@ -508,9 +693,8 @@ class Dispatcher:
         sm.transition(PipelineStage.TASK_BREAKDOWN)
         self.tui.stage("Stage 6: Execution Slice Breakdown")
         manifest_out = self.feature_dir / "task-manifest.yaml"
-        _, validation = self._invoke_validated_agent(
-            agent="planner",
-            prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out, self._agent_timeout(config, "planner")),
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_task_breakdown(plan_version, manifest_out, self._stage_timeout(config)),
             config=config,
             expected_type="task_manifest",
             stage=PipelineStage.TASK_BREAKDOWN.value,
@@ -534,9 +718,8 @@ class Dispatcher:
             sm.transition(PipelineStage.TASK_REVIEW)
             self.tui.stage(f"Stage 7: Execution Slice Review (iteration {iteration})")
             task_review_out = self.feature_dir / f"task-review-v{iteration}.yaml"
-            _, review_validation = self._invoke_validated_agent(
-                agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(task_review_out, self._agent_timeout(config, "plan-reviewer")),
+            _, review_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_task_reviewer(task_review_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
@@ -562,9 +745,8 @@ class Dispatcher:
             self.tui.stage(f"Stage 8: Execution Slice Fix (iteration {iteration})")
             current_manifest_version += 1
             task_fix_out = self.feature_dir / "task-manifest.yaml"
-            _, manifest_validation = self._invoke_validated_agent(
-                agent="planner",
-                prompt=prompt_builder.build_task_fix(iteration, task_fix_out, self._agent_timeout(config, "planner")),
+            _, manifest_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_task_fix(iteration, task_fix_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_FIX.value,
@@ -649,9 +831,8 @@ class Dispatcher:
 
         exec_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-execution-log.yaml"
         exec_out.parent.mkdir(parents=True, exist_ok=True)
-        _, validation = self._invoke_validated_agent(
-            agent="executor",
-            prompt=prompt_builder.build_executor(task_id, exec_out, self._agent_timeout(config, "executor")),
+        _, validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_executor(task_id, exec_out, self._stage_timeout(config)),
             config=config,
             expected_type="execution_result",
             stage=PipelineStage.TASK_EXECUTION.value,
@@ -714,9 +895,8 @@ class Dispatcher:
                 sm.transition(PipelineStage.FIX_ITERATION)
                 self._update_task_state(task_id, TaskState.NEEDS_FIX)
                 fix_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
-                self._invoke_agent(
-                    agent="executor",
-                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out, self._agent_timeout(config, "executor")),
+                self._invoke_stage(
+                    prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out, self._stage_timeout(config)),
                     config=config,
                     stage=PipelineStage.FIX_ITERATION.value,
                     task_id=task_id,
@@ -727,9 +907,8 @@ class Dispatcher:
             self.tui.stage(f"Stage 12: Reviewing {task_id} Against the Specification (iteration {iteration})")
             review_out = self.feature_dir / "tasks" / "done" / f"{task_id}-review-v{iteration}.yaml"
             review_out.parent.mkdir(parents=True, exist_ok=True)
-            _, review_validation = self._invoke_validated_agent(
-                agent="reviewer",
-                prompt=prompt_builder.build_reviewer(task_id, review_out, self._agent_timeout(config, "reviewer")),
+            _, review_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_reviewer(task_id, review_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="review",
                 stage=PipelineStage.PER_TASK_QUALITY.value,
@@ -758,9 +937,8 @@ class Dispatcher:
             sm.transition(PipelineStage.FIX_ITERATION)
             self._update_task_state(task_id, TaskState.NEEDS_FIX)
             fix_out2 = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
-            self._invoke_agent(
-                agent="executor",
-                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2, self._agent_timeout(config, "executor")),
+            self._invoke_stage(
+                prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2, self._stage_timeout(config)),
                 config=config,
                 stage=PipelineStage.FIX_ITERATION.value,
                 task_id=task_id,
@@ -786,9 +964,8 @@ class Dispatcher:
             sm.transition(PipelineStage.GAP_DETECTION)
             self.tui.stage("Stage 14: Specification-to-Code Gap Detection")
             gap_out = self.feature_dir / f"gap-report-v{depth + 1}.yaml"
-            _, validation = self._invoke_validated_agent(
-                agent="gap-detector",
-                prompt=prompt_builder.build_gap_detector(gap_out, self._agent_timeout(config, "gap-detector")),
+            _, validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_gap_detector(gap_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="gap_report",
                 stage=PipelineStage.GAP_DETECTION.value,
@@ -816,9 +993,8 @@ class Dispatcher:
             new_manifest_version = max(2, depth + 1)
             sm.transition(PipelineStage.TASK_BREAKDOWN)
             gap_manifest_out = self.feature_dir / "task-manifest.yaml"
-            result, task_validation = self._invoke_validated_agent(
-                agent="planner",
-                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out, self._agent_timeout(config, "planner")),
+            result, task_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_task_breakdown(plan_version, gap_manifest_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="task_manifest",
                 stage=PipelineStage.TASK_BREAKDOWN.value,
@@ -842,9 +1018,8 @@ class Dispatcher:
 
             sm.transition(PipelineStage.TASK_REVIEW)
             gap_review_out = self.feature_dir / f"task-review-v{new_manifest_version}.yaml"
-            _, review_validation = self._invoke_validated_agent(
-                agent="plan-reviewer",
-                prompt=prompt_builder.build_task_reviewer(gap_review_out, self._agent_timeout(config, "plan-reviewer")),
+            _, review_validation = self._invoke_validated_stage(
+                prompt=prompt_builder.build_task_reviewer(gap_review_out, self._stage_timeout(config)),
                 config=config,
                 expected_type="task_manifest_review",
                 stage=PipelineStage.TASK_REVIEW.value,
@@ -865,15 +1040,12 @@ class Dispatcher:
                 self.tui.warning("Gap re-entry tasks failed; pipeline blocked for human intervention.")
                 return False
 
-    def _agent_timeout(self, config: dict, agent: str) -> int:
-        """Look up the configured timeout (seconds) for an agent."""
-        agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
-        agent_config = config.get("agents", {}).get(agent_key, {})
-        return agent_config.get("timeout", 600)
+    def _stage_timeout(self, config: dict) -> int:
+        """Return the configured timeout (seconds) for stage invocations."""
+        return config.get("main_agent", {}).get("timeout", 900)
 
-    def _invoke_validated_agent(
+    def _invoke_validated_stage(
         self,
-        agent: str,
         prompt: str,
         config: dict,
         expected_type: str,
@@ -885,7 +1057,7 @@ class Dispatcher:
         if output_path and output_path.exists():
             output_path.unlink()
 
-        result = self._invoke_agent(agent, prompt, config, stage, task_id)
+        result = self._invoke_stage(prompt, config, stage, task_id)
 
         # Primary: read artifact from the file the agent wrote
         raw_text = ""
@@ -897,20 +1069,32 @@ class Dispatcher:
 
         validation = self.validator.validate(raw_text, expected_type)
         if not validation.valid:
-            self._report_validation_failure(agent, result, expected_type, validation)
+            self._report_validation_failure(stage, result, expected_type, validation)
         return result, validation
 
-    def _invoke_agent(
+    def _check_oauth_before_invoke(self):
+        """Check OAuth token expiry before invoking an agent. Fail fast with guidance."""
+        from .auth import check_oauth_expiry
+        status = check_oauth_expiry(self.xpatcher_home)
+        if status is None:
+            return  # Not using OAuth
+        if status["expired"]:
+            self.tui.error("OAuth access token has expired.")
+            self.tui.error("Refresh by running: claude auth login")
+            self.tui.error("Then retry: xpatcher resume <pipeline-id> --from-stage <stage>")
+            raise RuntimeError("OAuth token expired")
+        if status["needs_refresh"]:
+            self.tui.warning(f"OAuth token expires in {status['minutes_remaining']}m — consider refreshing soon.")
+
+    def _invoke_stage(
         self,
-        agent: str,
         prompt: str,
         config: dict,
         stage: str,
         task_id: str = "",
     ) -> AgentResult:
         self._raise_if_cancelled()
-        agent_key = "executor" if agent == "executor" else agent.replace("-", "_")
-        agent_config = config.get("agents", {}).get(agent_key, {})
+        self._check_oauth_before_invoke()
 
         # Pipeline-wide session: first call is fresh, all subsequent resume
         if not self._pipeline_session_id:
@@ -920,35 +1104,20 @@ class Dispatcher:
         if not self._pipeline_session_used:
             self._pipeline_session_used = True
 
-        if agent_config.get("command"):
-            invocation = AgentInvocation(
-                prompt=prompt,
-                timeout=agent_config.get("timeout", 600),
-                session_id=session_id,
-                resume=is_resume,
-                cancel_check=self._is_cancelled,
-                command_template=agent_config["command"],
-                resume_args_template=agent_config.get("resume_args"),
-            )
-        else:
-            model_key = "executor_default" if agent == "executor" else agent.replace("-", "_")
-            model = config.get("models", {}).get(model_key, config.get("models", {}).get(agent, "sonnet"))
-            timeout = config.get("timeouts", {}).get(agent.replace("-", "_"), config.get("timeouts", {}).get(agent, 600))
-            invocation = AgentInvocation(
-                prompt=prompt,
-                agent=agent,
-                model=model,
-                timeout=timeout,
-                session_id=session_id,
-                resume=is_resume,
-                cancel_check=self._is_cancelled,
-            )
+        timeout = self._stage_timeout(config)
+        invocation = AgentInvocation(
+            prompt=prompt,
+            timeout=timeout,
+            session_id=session_id,
+            resume=is_resume,
+            cancel_check=self._is_cancelled,
+        )
 
         if self.debug:
             cmd_preview = self.session.preview_cmd(invocation)
             project_slug = str(self.project_dir).replace("/", "-")
             cc_log = f"~/.claude/projects/{project_slug}/{session_id}.jsonl"
-            self.tui.debug(f"agent={agent} stage={stage} task={task_id or '-'} timeout={invocation.timeout}s session={session_id}")
+            self.tui.debug(f"stage={stage} task={task_id or '-'} timeout={invocation.timeout}s session={session_id}")
             self.tui.debug(f"$ {cmd_preview}")
             self.tui.debug(f"tail -f {cc_log}")
             invocation.debug_tailer = SessionTailer(self.project_dir, session_id)
@@ -956,7 +1125,7 @@ class Dispatcher:
         try:
             result = self.session.invoke(invocation)
         except subprocess.TimeoutExpired:
-            self.tui.warning(f"Agent '{agent}' timed out after {invocation.timeout}s")
+            self.tui.warning(f"Stage '{stage}' timed out after {invocation.timeout}s")
             result = AgentResult(
                 session_id=session_id,
                 exit_code=124,
@@ -975,12 +1144,21 @@ class Dispatcher:
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
         self._update_status(total_cost_usd=self.total_cost_usd)
-        log_path = self._write_agent_log(agent, result, task_id)
+        log_path = self._write_agent_log(stage, result, task_id)
+
+        # Show agent's final message with colored stripe
+        is_error = result.exit_code != 0
+        summary = result.raw_text.strip()
+        if summary:
+            # Truncate very long output to ~500 chars
+            if len(summary) > 500:
+                summary = summary[:500] + f"\n... ({len(result.raw_text)} chars total, truncated)"
+            self.tui.agent_result(summary, is_error=is_error)
 
         if self.debug:
             xp_log = _home_relative(log_path) if log_path else "-"
             self.tui.debug(
-                f"done agent={agent} "
+                f"done stage={stage} "
                 f"{result.duration_ms}ms turns={result.num_turns} ${result.cost_usd:.4f} "
                 f"exit={result.exit_code} stop={result.stop_reason} output={len(result.raw_text)}ch"
             )
@@ -1187,9 +1365,8 @@ class Dispatcher:
         version = len(existing_reviews) + 1
         review_out = self.feature_dir / "tasks" / "done" / f"{task_id}-review-v{version}.yaml"
         review_out.parent.mkdir(parents=True, exist_ok=True)
-        _, review_validation = self._invoke_validated_agent(
-            agent="reviewer",
-            prompt=prompt_builder.build_reviewer(task_id, review_out, self._agent_timeout(config, "reviewer")),
+        _, review_validation = self._invoke_validated_stage(
+            prompt=prompt_builder.build_reviewer(task_id, review_out, self._stage_timeout(config)),
             config=config,
             expected_type="review",
             stage=PipelineStage.PER_TASK_QUALITY.value,
@@ -1239,17 +1416,17 @@ class Dispatcher:
 
     def _report_validation_failure(
         self,
-        agent: str,
+        stage: str,
         result: AgentResult,
         expected_type: str,
         validation: ValidationResult,
     ) -> None:
-        """Log detailed diagnostics when an agent produces invalid output."""
+        """Log detailed diagnostics when a stage produces invalid output."""
         session_id = result.session_id or "(unknown)"
         project_slug = str(self.project_dir).replace("/", "-")
         cc_log = f"~/.claude/projects/{project_slug}/{session_id}.jsonl"
 
-        self.tui.error(f"Agent '{agent}' returned invalid output")
+        self.tui.error(f"Stage '{stage}' returned invalid output")
         self.tui.error(f"  Expected artifact type: {expected_type}")
         for err in validation.errors:
             self.tui.error(f"  - {err}")
@@ -1357,6 +1534,203 @@ def _show_status(args, xpatcher_home):
     for pid, record in sorted(_find_all_pipeline_records(xpatcher_home).items()):
         state = load_yaml_file(Path(record["feature_dir"]) / "pipeline-state.yaml")
         print(f"{pid}  {state.get('feature', '?')}  {state.get('current_stage', '?')}  {state.get('status', '?')}")
+
+
+def _show_progress(args, xpatcher_home):
+    record = _find_pipeline_record(xpatcher_home, args.pipeline_id)
+    if record is None:
+        print(f"Unknown pipeline: {args.pipeline_id}")
+        return 1
+
+    feature_dir = Path(record["feature_dir"])
+    state = load_yaml_file(feature_dir / "pipeline-state.yaml")
+    pipeline_id = state.get("pipeline_id", args.pipeline_id)
+    status = state.get("status", "?")
+    current_stage = state.get("current_stage", "?")
+    cost = state.get("total_cost_usd", 0.0)
+    created = state.get("created_at", "")
+    transitions = state.get("transitions", [])
+    task_states = state.get("task_states", {})
+
+    # Pipeline ordered stages with display labels
+    STAGE_DISPLAY = [
+        ("intent_capture",  " 1", "Intent"),
+        ("planning",        " 2", "Plan"),
+        ("plan_review",     " 3", "Review"),
+        ("plan_fix",        " 4", "Fix"),
+        ("plan_approval",   " 5", "Approve"),
+        ("task_breakdown",  " 6", "Tasks"),
+        ("task_review",     " 7", "TaskRev"),
+        ("task_fix",        " 8", "TaskFix"),
+        ("prioritization",  " 9", "Priority"),
+        ("execution_graph", "10", "DAG"),
+        ("task_execution",  "11", "Execute"),
+        ("per_task_quality","12", "Quality"),
+        ("fix_iteration",   "13", "FixIter"),
+        ("gap_detection",   "14", "Gaps"),
+        ("documentation",   "15", "Docs"),
+        ("completion",      "16", "Done"),
+    ]
+
+    # Build per-stage timing from transitions
+    stage_visits: dict[str, list[dict]] = {}  # stage -> [{enter, exit, duration_s}]
+    for i, t in enumerate(transitions):
+        to_stage = t["to"]
+        enter_ts = t["at"]
+        # Find exit: next transition's timestamp
+        exit_ts = transitions[i + 1]["at"] if i + 1 < len(transitions) else None
+        if to_stage not in stage_visits:
+            stage_visits[to_stage] = []
+        duration_s = 0.0
+        if exit_ts:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                fmt = "%Y-%m-%dT%H:%M:%S.%f%z" if "." in enter_ts else "%Y-%m-%dT%H:%M:%S%z"
+                fmt2 = "%Y-%m-%dT%H:%M:%S.%f%z" if "." in exit_ts else "%Y-%m-%dT%H:%M:%S%z"
+                t_enter = _dt.fromisoformat(enter_ts)
+                t_exit = _dt.fromisoformat(exit_ts)
+                duration_s = (t_exit - t_enter).total_seconds()
+            except (ValueError, TypeError):
+                pass
+        stage_visits[to_stage].append({"enter": enter_ts, "exit": exit_ts, "duration_s": duration_s})
+
+    # Aggregate per-stage: total time, visit count
+    stage_summary: dict[str, dict] = {}
+    for stage, visits in stage_visits.items():
+        total_s = sum(v["duration_s"] for v in visits)
+        stage_summary[stage] = {"total_s": total_s, "visits": len(visits)}
+
+    # Total elapsed time
+    total_elapsed_s = 0.0
+    if created and transitions:
+        try:
+            t_start = datetime.fromisoformat(created)
+            t_last = datetime.fromisoformat(transitions[-1]["at"])
+            total_elapsed_s = (t_last - t_start).total_seconds()
+        except (ValueError, TypeError):
+            pass
+
+    # Per-agent cost from log files
+    agent_costs: dict[str, dict] = {}  # log_name -> {duration_ms, turns, cost, stage_label}
+    log_dir = feature_dir / "logs"
+    if log_dir.exists():
+        for log_file in sorted(log_dir.glob("agent-*.jsonl")):
+            try:
+                with open(log_file) as f:
+                    lines = [json.loads(line) for line in f]
+                for entry in lines:
+                    if entry.get("type") == "result":
+                        name = log_file.stem  # e.g. agent-planner-20260402-180619
+                        agent_costs[name] = {
+                            "duration_ms": entry.get("duration_ms", 0),
+                            "turns": entry.get("num_turns", 0),
+                            "cost": entry.get("cost_usd", 0.0),
+                        }
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Status icon
+    status_icon = {"running": "▶", "completed": "✓", "done": "✓", "failed": "✗",
+                   "paused": "⏸", "waiting_for_human": "⏸", "cancelled": "⊘"}.get(status, "?")
+
+    # Header
+    desc = state.get("description", "").strip()[:80]
+    print(f"{pipeline_id}  {status_icon} {status}  ${cost:.2f}  {_fmt_duration(total_elapsed_s)}")
+    if desc:
+        print(f"  {desc}")
+    print()
+
+    # Stage progress table
+    reached_stages = set(stage_visits.keys())
+    # All visited stages except current are "done"
+    done_stages = reached_stages - {current_stage}
+    # Find the last reached position in the display order
+    last_reached_idx = -1
+    for idx, (stage_key, _, _) in enumerate(STAGE_DISPLAY):
+        if stage_key in reached_stages:
+            last_reached_idx = idx
+
+    for idx, (stage_key, num, label) in enumerate(STAGE_DISPLAY):
+        info = stage_summary.get(stage_key)
+        if stage_key == current_stage:
+            if status in ("failed", "cancelled"):
+                marker = "✗"
+            elif status in ("paused", "waiting_for_human"):
+                marker = "⏸"
+            else:
+                marker = "▶"
+            time_str = _fmt_duration(info["total_s"]) if info else ""
+            visits = info["visits"] if info else 0
+            extra = f"  x{visits}" if visits > 1 else ""
+            print(f"  {marker} {num} {label:<8s} {time_str:>6s}{extra}  ← {status}")
+        elif stage_key in done_stages and info:
+            time_str = _fmt_duration(info["total_s"])
+            visits = info["visits"]
+            extra = f"  x{visits}" if visits > 1 else ""
+            print(f"  ✓ {num} {label:<8s} {time_str:>6s}{extra}")
+        elif idx > last_reached_idx:
+            print(f"  · {num} {label}")
+
+    # Task states (if any)
+    if task_states:
+        print()
+        for tid, ts in sorted(task_states.items()):
+            t_icon = {"succeeded": "✓", "failed": "✗", "running": "▶",
+                      "stuck": "⚠", "skipped": "⊘", "pending": "·",
+                      "blocked": "⏸", "needs_fix": "⟳"}.get(ts, "?")
+            print(f"  {t_icon} {tid}: {ts}")
+
+    # Agent log summary — aggregate by agent type
+    if agent_costs:
+        print()
+        # Group by agent name (e.g. "planner", "executor-task-001")
+        agent_agg: dict[str, dict] = {}
+        for name, info in agent_costs.items():
+            # agent-planner-20260402-180619 -> planner
+            # agent-executor-task-001-20260401-233648 -> executor
+            parts = name.replace("agent-", "").split("-")
+            # Find where the timestamp starts (8-digit date)
+            agent_name_parts = []
+            for p in parts:
+                if len(p) == 8 and p.isdigit():
+                    break
+                agent_name_parts.append(p)
+            agent_key = "-".join(agent_name_parts)
+            if agent_key not in agent_agg:
+                agent_agg[agent_key] = {"runs": 0, "total_ms": 0, "total_turns": 0, "total_cost": 0.0}
+            agent_agg[agent_key]["runs"] += 1
+            agent_agg[agent_key]["total_ms"] += info["duration_ms"]
+            agent_agg[agent_key]["total_turns"] += info["turns"]
+            agent_agg[agent_key]["total_cost"] += info.get("cost", 0.0)
+
+        print("  Agents:")
+        for agent_key, agg in sorted(agent_agg.items()):
+            dur_s = agg["total_ms"] / 1000
+            runs = agg["runs"]
+            turns = agg["total_turns"]
+            c = agg["total_cost"]
+            cost_str = f"  ${c:.2f}" if c else ""
+            runs_str = f"  x{runs}" if runs > 1 else ""
+            print(f"    {agent_key:<20s} {_fmt_duration(dur_s):>6s}  {turns:>3d}t{runs_str}{cost_str}")
+
+    print()
+    return 0
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds into compact human-readable: 2m30s, 15s, 1h5m."""
+    if seconds <= 0:
+        return ""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s" if secs else f"{minutes}m"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h{mins:02d}m"
 
 
 def _list_pipelines(xpatcher_home):
@@ -1594,8 +1968,11 @@ def main():
     start_parser.add_argument("--verbose", action="store_true")
     start_parser.add_argument("--debug", action="store_true", help="Show detailed agent execution info (commands, session IDs, timings, output)")
 
+    _stage_list = "intent_capture|planning|plan_review|plan_approval|task_breakdown|task_execution|gap_detection|documentation|completion"
     resume_parser = subparsers.add_parser("resume", help="Resume an interrupted pipeline")
     resume_parser.add_argument("pipeline_id")
+    resume_parser.add_argument("--from-stage", default=None, dest="from_stage",
+                               help=f"Resume from a specific stage: {_stage_list}")
     resume_parser.add_argument("--debug", action="store_true", help="Show detailed agent execution info")
 
     status_parser = subparsers.add_parser("status", help="Show pipeline status")
@@ -1613,6 +1990,9 @@ def main():
 
     delete_parser = subparsers.add_parser("delete", help="Delete a pipeline and all its artifacts")
     delete_parser.add_argument("pipeline_id")
+
+    progress_parser = subparsers.add_parser("progress", help="Show detailed pipeline progress with per-stage timings and costs")
+    progress_parser.add_argument("pipeline_id")
 
     subparsers.add_parser("pending", help="Show pipelines awaiting human input")
 
@@ -1639,7 +2019,9 @@ def main():
     if args.command == "resume":
         record = _find_pipeline_record(xpatcher_home, args.pipeline_id)
         project_dir = Path(record["project_dir"]) if record else Path.cwd()
-        Dispatcher(project_dir, xpatcher_home, debug=args.debug).resume(args.pipeline_id)
+        Dispatcher(project_dir, xpatcher_home, debug=args.debug).resume(
+            args.pipeline_id, from_stage=args.from_stage, debug=args.debug,
+        )
         return
     if args.command == "status":
         _show_status(args, xpatcher_home)
@@ -1653,6 +2035,8 @@ def main():
         sys.exit(_skip_tasks(args, xpatcher_home))
     if args.command == "delete":
         sys.exit(_delete_pipeline(args, xpatcher_home))
+    if args.command == "progress":
+        sys.exit(_show_progress(args, xpatcher_home))
     if args.command == "pending":
         _show_pending(xpatcher_home)
         return
