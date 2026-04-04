@@ -21,7 +21,7 @@ from .yaml_utils import load_yaml_file, save_yaml_file, now_iso
 # ---------------------------------------------------------------------------
 
 STAGE_LANE_MAP: dict[str, str] = {
-    "intent_capture": "spec_author",
+    "intent_capture": "intent_author",
     "planning": "spec_author",
     "plan_fix": "spec_author",
     "plan_review": "spec_review",
@@ -40,6 +40,7 @@ STAGE_LANE_MAP: dict[str, str] = {
 }
 
 LANE_AGENT_MAP: dict[str, str] = {
+    "intent_author": "planner",
     "spec_author": "planner",
     "spec_review": "plan-reviewer",
     "manifest_author": "planner",
@@ -50,6 +51,7 @@ LANE_AGENT_MAP: dict[str, str] = {
 }
 
 DEFAULT_ROTATION_LIMITS: dict[str, int] = {
+    "intent_author": 2,
     "spec_author": 8,
     "spec_review": 3,
     "manifest_author": 6,

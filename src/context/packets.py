@@ -17,6 +17,24 @@ _SKIP_DIRS = frozenset({
     "dist", "build", ".mypy_cache", "vendor", ".eggs",
 })
 _MAX_FILES_WALK = 10_000
+_MAX_DISCOVERY_DEPTH = 4
+_MAX_MANIFEST_MATCHES = 24
+_MAX_SCRIPT_MATCHES = 12
+_MAX_SCOUT_FILES = 8
+_MAX_SCOUT_LINES = 80
+_INVENTORY_EXCLUDE_PARTS = {"data", ".env", ".ssh", "secrets", "credentials"}
+
+
+def _is_inventory_safe(rel_path: Path) -> bool:
+    rel_text = str(rel_path)
+    parts = set(rel_path.parts)
+    if any(part.startswith("data_backup") for part in rel_path.parts):
+        return False
+    if parts & _INVENTORY_EXCLUDE_PARTS:
+        return False
+    if rel_path.name.startswith(".env"):
+        return False
+    return True
 
 
 class ContextManager:
@@ -63,15 +81,46 @@ class ContextManager:
                      ".php": "php", ".cs": "csharp", ".cpp": "cpp", ".c": "c"}
         inventory["primary_languages"] = [lang for ext, lang in lang_map.items() if exts.get(ext, 0) > 0][:5]
 
-        # Package managers
+        # Package managers and nested workspace manifests
         pm_markers = {
             "pyproject.toml": "uv/pip", "setup.py": "pip", "Pipfile": "pipenv",
             "package.json": "npm", "yarn.lock": "yarn", "pnpm-lock.yaml": "pnpm",
             "go.mod": "go", "Cargo.toml": "cargo", "Gemfile": "bundler",
             "pom.xml": "maven", "build.gradle": "gradle",
         }
-        inventory["package_managers"] = [pm for marker, pm in pm_markers.items()
-                                          if (self.project_dir / marker).exists()]
+        workspace_manifests: list[dict[str, str]] = []
+        package_managers: set[str] = set()
+        manifest_matches = 0
+        key_configs_seen: set[str] = set()
+        notable_scripts: list[str] = []
+        script_names = {"start.sh", "setup.sh", "deploy.sh", "entrypoint.sh"}
+
+        for root, dirs, files in os.walk(self.project_dir):
+            rel_root = Path(root).relative_to(self.project_dir)
+            if len(rel_root.parts) > _MAX_DISCOVERY_DEPTH:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            for filename in files:
+                rel_path = rel_root / filename if rel_root != Path(".") else Path(filename)
+                rel_text = str(rel_path)
+                if not _is_inventory_safe(rel_path):
+                    continue
+                if filename in pm_markers and manifest_matches < _MAX_MANIFEST_MATCHES:
+                    workspace_manifests.append({"path": rel_text, "type": pm_markers[filename]})
+                    package_managers.add(pm_markers[filename])
+                    manifest_matches += 1
+                if filename in {
+                    "pyproject.toml", "package.json", "vite.config.ts", "vite.config.js",
+                    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                    ".env.example", "requirements.txt", "Makefile", "CLAUDE.md", "AGENTS.md",
+                } and rel_text not in key_configs_seen:
+                    key_configs_seen.add(rel_text)
+                if filename in script_names and len(notable_scripts) < _MAX_SCRIPT_MATCHES:
+                    notable_scripts.append(rel_text)
+
+        inventory["package_managers"] = sorted(package_managers)
+        inventory["workspace_manifests"] = workspace_manifests
 
         # Test frameworks — read pyproject.toml once
         test_fws: set[str] = set()
@@ -95,14 +144,10 @@ class ContextManager:
         inventory["source_roots"] = source_roots or ["."]
         inventory["test_roots"] = test_roots
 
-        # Key configs
-        inventory["key_configs"] = [
-            name for name in ("pyproject.toml", "setup.cfg", "setup.py", "package.json",
-                              "tsconfig.json", "Makefile", "Dockerfile",
-                              "docker-compose.yml", ".github/workflows", "config.yaml",
-                              "config.json", ".env.example")
-            if (self.project_dir / name).exists()
-        ]
+        # Key configs and scripts
+        inventory["key_configs"] = sorted(key_configs_seen)
+        if notable_scripts:
+            inventory["notable_scripts"] = notable_scripts
 
         # Common commands — reuse pyproject_content
         commands: dict[str, list[str]] = {}
@@ -139,6 +184,43 @@ class ContextManager:
         save_yaml_file(self.context_dir / "feature-brief.yaml", brief)
         return brief
 
+    def build_implementation_scout(self) -> dict[str, Any]:
+        """Create implementation-scout.yaml with a bounded set of likely-relevant files."""
+        inventory = load_yaml_file(self.context_dir / "repo-inventory.yaml")
+        candidates: list[str] = []
+        for rel_path in inventory.get("notable_scripts", []):
+            if rel_path not in candidates:
+                candidates.append(rel_path)
+        for rel_path in inventory.get("key_configs", []):
+            if rel_path not in candidates:
+                candidates.append(rel_path)
+
+        entries: list[dict[str, Any]] = []
+        for rel_path in candidates[:_MAX_SCOUT_FILES]:
+            path = self.project_dir / rel_path
+            if not path.is_file():
+                continue
+            try:
+                lines = path.read_text().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            entries.append(
+                {
+                    "path": rel_path,
+                    "line_count": len(lines),
+                    "preview": lines[:_MAX_SCOUT_LINES],
+                }
+            )
+
+        scout = {
+            "type": "implementation_scout",
+            "schema_version": "1.0",
+            "created_at": now_iso(),
+            "entries": entries,
+        }
+        save_yaml_file(self.context_dir / "implementation-scout.yaml", scout)
+        return scout
+
     def build_bootstrap_context(self, description: str, intent_data: dict | None = None) -> dict[str, Path]:
         """Run the full bootstrap phase: create all stable context artifacts."""
         artifacts = {}
@@ -146,6 +228,8 @@ class ContextManager:
         artifacts["repo_inventory"] = self.context_dir / "repo-inventory.yaml"
         self.build_feature_brief(description, intent_data)
         artifacts["feature_brief"] = self.context_dir / "feature-brief.yaml"
+        self.build_implementation_scout()
+        artifacts["implementation_scout"] = self.context_dir / "implementation-scout.yaml"
         return artifacts
 
     # -------------------------------------------------------------------

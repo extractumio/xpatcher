@@ -42,8 +42,10 @@ if not agent_name:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-READ_ONLY_AGENTS = {"planner", "plan-reviewer", "reviewer", "gap-detector", "explorer"}
+READ_ONLY_AGENTS = {"plan-reviewer", "reviewer", "gap-detector", "explorer"}
+BASH_RESTRICTED_AGENTS = READ_ONLY_AGENTS | {"planner"}
 WRITE_TOOLS = {"Edit", "Write", "NotebookEdit"}
+READ_TOOLS = {"Read", "Grep", "Glob"}
 
 # Per-agent Bash command allowlists.
 # Agents in this dict can ONLY run commands whose base name is in the set.
@@ -97,6 +99,35 @@ SAFE_PIPE_TARGETS = {
 # File patterns for scope enforcement.
 TEST_FILE_PATTERNS = [r"test_", r"_test\.", r"\.spec\.", r"\.test\.", r"tests/", r"__tests__/"]
 DOC_FILE_PATTERNS = [r"\.md$", r"\.rst$", r"\.txt$", r"CHANGELOG", r"README", r"docs/", r"doc/"]
+ARTIFACT_FILE_PATTERNS = [
+    r"/\.xpatcher/",
+    r"/xpatcher/\.xpatcher/",
+    r"pipeline-state\.ya?ml$",
+    r"intent\.ya?ml$",
+    r"plan(-review)?-v\d+\.ya?ml$",
+    r"task-review-v\d+\.ya?ml$",
+    r"task-manifest\.ya?ml$",
+    r"docs-report\.ya?ml$",
+    r"gap-report\.ya?ml$",
+    r"validation-failures/",
+]
+SENSITIVE_FILE_PATTERNS = [
+    r"(^|/)\.env(\..*)?$",
+    r"(^|/)\.npmrc$",
+    r"(^|/)\.pypirc$",
+    r"(^|/)id_[^/]+$",
+    r"\.(pem|key|p12|pfx|crt|cer)$",
+    r"(^|/)\.ssh/",
+    r"(^|/)secrets?/",
+    r"(^|/)credentials?/",
+    r"(^|/)data(_backup_[^/]+)?($|/)",
+]
+BROAD_GLOB_PATTERNS = [
+    r"^\*\*/\*\.[^/]+$",
+    r"^\*\*/\*$",
+    r"/\*\*/\*\.[^/]+$",
+    r"/\*\*/\*$",
+]
 
 # Dangerous commands that should NEVER run.
 DANGEROUS_PATTERNS = [
@@ -133,11 +164,47 @@ def _check_pipe_targets(command: str, agent_name: str) -> None:
                 )
 
 
+def _tool_path_candidates(tool_name: str, tool_input: dict) -> list[str]:
+    if tool_name in {"Read", "Edit", "Write", "NotebookEdit"}:
+        return [str(tool_input.get("file_path", ""))]
+    if tool_name == "Grep":
+        return [str(tool_input.get("path", ""))]
+    if tool_name == "Glob":
+        return [str(tool_input.get("path", ""))]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Policy 1: Read-only agents cannot use Edit/Write/NotebookEdit
 # ---------------------------------------------------------------------------
 if agent_name in READ_ONLY_AGENTS and tool_name in WRITE_TOOLS:
     block(f"Agent '{agent_name}' is read-only and cannot use {tool_name}")
+
+# Planner may update xpatcher-managed artifacts in place, but not project code.
+if agent_name == "planner" and tool_name in WRITE_TOOLS:
+    file_path = tool_input.get("file_path", "")
+    if not any(re.search(p, file_path) for p in ARTIFACT_FILE_PATTERNS):
+        block(
+            "Planner may only write or edit xpatcher artifact files "
+            f"(plans, manifests, reviews, pipeline state). Blocked: '{file_path}'"
+        )
+
+# Sensitive files must never be read during planning/review-style work.
+if agent_name in (READ_ONLY_AGENTS | {"planner", "tech-writer", "tester"}) and tool_name in READ_TOOLS:
+    for path in _tool_path_candidates(tool_name, tool_input):
+        if any(re.search(pattern, path) for pattern in SENSITIVE_FILE_PATTERNS):
+            block(
+                f"Agent '{agent_name}' cannot access sensitive files or directories during this stage. "
+                f"Blocked: '{path}'"
+            )
+
+if agent_name in (READ_ONLY_AGENTS | {"planner"}) and tool_name == "Glob":
+    pattern = str(tool_input.get("pattern", ""))
+    if any(re.search(expr, pattern) for expr in BROAD_GLOB_PATTERNS):
+        block(
+            f"Agent '{agent_name}' cannot use broad recursive glob patterns during planning/review. "
+            f"Blocked: '{pattern}'"
+        )
 
 # ---------------------------------------------------------------------------
 # Policy 2 & 3 & 4: Bash enforcement for agents with allowlists
@@ -159,7 +226,7 @@ if tool_name == "Bash" and agent_name in BASH_ALLOWLISTS:
         )
 
     # Policy 3: Even allowed commands cannot use write patterns
-    if agent_name in READ_ONLY_AGENTS:
+    if agent_name in BASH_RESTRICTED_AGENTS:
         for pattern in BASH_WRITE_PATTERNS:
             if re.search(pattern, command):
                 # Special case: allow single pipe (|) to safe targets
@@ -177,7 +244,7 @@ if tool_name == "Bash" and agent_name in BASH_ALLOWLISTS:
                 )
 
     # Policy 4: Block command chaining for read-only agents
-    if agent_name in READ_ONLY_AGENTS:
+    if agent_name in BASH_RESTRICTED_AGENTS:
         if re.search(r";|\$\(|`|&&|\|\|", command):
             pipe_parts = command.split("|")
             if len(pipe_parts) > 1:

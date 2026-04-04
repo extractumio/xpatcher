@@ -2,13 +2,15 @@
 
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from src.artifacts.store import ArtifactStore
 from src.context.builder import PromptBuilder
-from src.dispatcher.core import CancelledPipelineError, Dispatcher, _project_pipeline_index_path, _register_pipeline_index, _skip_tasks
+from src.dispatcher.core import CancelledPipelineError, Dispatcher, _branch_name_for, _collect_pipeline_session_ids, _kill_dispatcher_process, _project_pipeline_index_path, _register_pipeline_index, _skip_tasks
 from src.dispatcher.session import AgentResult
 from src.dispatcher.state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskState
 
@@ -100,6 +102,7 @@ class TestDispatcherArtifacts:
         manifest = _manifest()
         manifest["tasks"][0]["acceptance_criteria"][0]["command"] = ""
         dispatcher._save_task_manifest(store, manifest, manifest_version=1)
+        monkeypatch.setattr(dispatcher, "_ensure_valid_task_spec", lambda sm, task_id: manifest["tasks"][0])
 
         monkeypatch.setattr(
             dispatcher,
@@ -119,6 +122,55 @@ class TestDispatcherArtifacts:
         )
 
         assert passed is True
+
+    def test_quality_loop_fails_fast_when_fix_output_is_invalid(self, tmp_path, monkeypatch):
+        dispatcher = _make_dispatcher(tmp_path)
+        store = ArtifactStore(dispatcher.feature_dir)
+        manifest = _manifest()
+        dispatcher._save_task_manifest(store, manifest, manifest_version=1)
+        dispatcher.state_file.write(
+            {
+                "current_stage": "per_task_quality",
+                "status": "running",
+                "task_states": {"task-001": "running"},
+                "iterations": {},
+                "transitions": [],
+                "total_cost_usd": 0.0,
+            }
+        )
+
+        monkeypatch.setattr(
+            dispatcher,
+            "_run_acceptance_checks",
+            lambda task_spec: {
+                "type": "test_result",
+                "task_id": task_spec["id"],
+                "overall": "fail",
+                "test_results": [],
+                "regression_failures": ["ac-01: command failed"],
+                "verification_summary": {},
+            },
+        )
+        monkeypatch.setattr(dispatcher, "_only_verification_spec_failures", lambda report: False)
+        monkeypatch.setattr(
+            dispatcher,
+            "_invoke_validated_stage",
+            lambda *args, **kwargs: (
+                AgentResult(),
+                SimpleNamespace(valid=False, errors=["bad execution result"], data={}),
+            ),
+        )
+
+        passed = dispatcher._run_quality_loop(
+            "task-001",
+            {"iterations": {"quality_loop_max": 2}},
+            PromptBuilder(dispatcher.feature_dir, dispatcher.project_dir),
+            store,
+            PipelineStateMachine(dispatcher.state_file),
+        )
+
+        assert passed is False
+        assert dispatcher.state_file.read()["task_states"]["task-001"] == "failed"
 
 
 class TestDispatcherCancellation:
@@ -143,6 +195,50 @@ class TestDispatcherCancellation:
             raise AssertionError("expected cancellation to short-circuit dispatcher")
 
 
+class TestPipelineFailureHandling:
+    def test_start_marks_pipeline_failed_on_unhandled_exception(self, tmp_path, monkeypatch):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / ".git").mkdir()
+        home = tmp_path / "home"
+        home.mkdir()
+        dispatcher = Dispatcher(project_dir, home)
+
+        monkeypatch.setattr(dispatcher.session, "preflight", lambda: SimpleNamespace(ok=True, cli_version="test"))
+        monkeypatch.setattr(dispatcher, "_require_auth", lambda: None)
+        monkeypatch.setattr(dispatcher, "_load_config", lambda: {"main_agent": {"timeout": 900}})
+        monkeypatch.setattr(dispatcher, "_run_pipeline", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        def fake_run(args, cwd=None, capture_output=False, text=False):
+            if args[:2] == ["git", "status"]:
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+            if args[:2] == ["git", "checkout"]:
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+            raise AssertionError(args)
+
+        monkeypatch.setattr("src.dispatcher.core.subprocess.run", fake_run)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            dispatcher.start("Test failing pipeline")
+
+        state_files = list((home / ".xpatcher").glob("projects/*/*/pipeline-state.yaml"))
+        assert len(state_files) == 1
+        state = yaml.safe_load(state_files[0].read_text())
+        assert state["current_stage"] == "failed"
+        assert state["status"] == "failed"
+
+
+class TestPipelineIdentity:
+    def test_feature_dir_and_branch_are_pipeline_scoped(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+
+        feature_dir = dispatcher._feature_dir_for("same-feature", "xp-20260403-abcd")
+        branch_name = _branch_name_for("same-feature", "xp-20260403-abcd")
+
+        assert feature_dir.name == "same-feature--xp-20260403-abcd"
+        assert branch_name == "xpatcher/same-feature-xp-20260403-abcd"
+
+
 class TestDispatcherPersistence:
     def test_invoke_stage_persists_cost_and_logs(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
@@ -165,7 +261,69 @@ class TestDispatcherPersistence:
         log_files = list((dispatcher.feature_dir / "logs").glob("*documentation*.jsonl"))
 
         assert state["total_cost_usd"] == 1.25
+        assert state["active_stage"] == "documentation"
+        assert state["active_session_id"]
         assert log_files
+
+    def test_invoke_stage_persists_running_context_before_completion(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+
+        def fake_invoke(invocation):
+            state = dispatcher.state_file.read()
+            assert state["active_stage"] == "planning"
+            assert state["active_session_id"] == invocation.session_id
+            return AgentResult(session_id=invocation.session_id, raw_text="", events=[{"type": "result"}])
+
+        dispatcher.session.invoke = fake_invoke
+        dispatcher._invoke_stage(
+            prompt="make a plan",
+            config={"main_agent": {"timeout": 900}},
+            stage="planning",
+        )
+
+
+class TestSessionCleanup:
+    def test_collect_pipeline_session_ids_reads_v1_and_v2_sources(self, tmp_path):
+        feature_dir = tmp_path / "feature"
+        (feature_dir / "lanes").mkdir(parents=True)
+        (feature_dir / "sessions.yaml").write_text(
+            yaml.safe_dump({"sessions": {"sess-v1": {}, "sess-shared": {}}})
+        )
+        (feature_dir / "pipeline-state.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "active_session_id": "sess-active",
+                    "lane_sessions": {
+                        "spec_author": {"session_id": "sess-lane-state"},
+                        "spec_review": {"session_id": "sess-shared"},
+                    },
+                }
+            )
+        )
+        (feature_dir / "lanes" / "lane-spec_author.yaml").write_text(
+            yaml.safe_dump({"session_id": "sess-lane-file"})
+        )
+
+        assert _collect_pipeline_session_ids(feature_dir) == {
+            "sess-v1",
+            "sess-shared",
+            "sess-active",
+            "sess-lane-state",
+            "sess-lane-file",
+        }
+
+    def test_kill_dispatcher_process_uses_pipeline_state_pid(self, tmp_path, monkeypatch):
+        feature_dir = tmp_path / "feature"
+        feature_dir.mkdir()
+        (feature_dir / "pipeline-state.yaml").write_text(yaml.safe_dump({"dispatcher_pid": 43210}))
+        killed = []
+
+        monkeypatch.setattr("src.dispatcher.core.os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+        _kill_dispatcher_process(feature_dir)
+
+        assert killed
+        assert killed[0][0] == 43210
 
     def test_expired_oauth_only_warns_before_invoke(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
@@ -233,6 +391,16 @@ class TestSpecificationAutomation:
                     "scope": ["add login flow"],
                     "constraints": [],
                     "clarifying_questions": [],
+                }
+            )
+        )
+        (dispatcher.feature_dir / "plan-v1.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "type": "plan",
+                    "summary": "A valid plan summary for automatic approval tests",
+                    "phases": [{"id": "phase-1", "name": "Phase 1", "description": "Desc", "tasks": [{"id": "task-001", "description": "Implement login flow end to end", "files": ["app.py"], "acceptance": ["Tests pass successfully"], "depends_on": [], "estimated_complexity": "low"}]}],
+                    "risks": [],
                 }
             )
         )
@@ -392,6 +560,16 @@ class TestAcceptanceChecks:
 
         assert report["overall"] == "pass"
 
+    def test_shell_negation_runs_via_shell(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        marker = dispatcher.project_dir / "marker.txt"
+        task["acceptance_criteria"][0]["command"] = f"! test -f {marker.name}"
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "pass"
+
     def test_invalid_python_c_is_reported_as_spec_failure(self, tmp_path):
         dispatcher = _make_dispatcher(tmp_path)
         task = _manifest()["tasks"][0]
@@ -402,6 +580,16 @@ class TestAcceptanceChecks:
         assert report["overall"] == "fail"
         assert "invalid python -c program" in report["regression_failures"][0]
         assert dispatcher._only_verification_spec_failures(report) is True
+
+    def test_missing_executable_is_reported_without_crashing(self, tmp_path):
+        dispatcher = _make_dispatcher(tmp_path)
+        task = _manifest()["tasks"][0]
+        task["acceptance_criteria"][0]["command"] = "definitely-not-a-real-binary --version"
+
+        report = dispatcher._run_acceptance_checks(task)
+
+        assert report["overall"] == "fail"
+        assert "command execution error" in report["regression_failures"][0]
 
 
 class TestGapReentryBlocked:

@@ -6,6 +6,7 @@ import signal
 import subprocess
 import time
 import uuid
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ class SessionTailer:
 
     def __init__(self, project_dir: Path, session_id: str, emit_debug: bool = True):
         slug = str(project_dir).replace("/", "-")
+        self._project_dir = project_dir.resolve()
         self._watch_dir = Path.home() / ".claude" / "projects" / slug
         self._session_id = session_id
         self._emit_debug = emit_debug
@@ -101,7 +103,7 @@ class SessionTailer:
                     detail = self._tool_summary(name, inp)
                     if self._emit_debug:
                         self._emit(f"{prefix}{name}: {detail}")
-                    return TailerActivity(actor=self._actor_for_path(path), summary=detail)
+                    return TailerActivity(actor=self._actor_for_path(path), tool_name=name, summary=detail)
                 elif bt == "text":
                     text = block.get("text", "").strip()
                     if text:
@@ -119,23 +121,22 @@ class SessionTailer:
     def _actor_for_path(self, path: Path) -> str:
         return self._agent_labels.get(path) or ("main-agent" if path.stem == self._session_id else f"agent-{path.stem[:8]}")
 
-    @staticmethod
-    def _tool_summary(name: str, inp: dict) -> str:
+    def _tool_summary(self, name: str, inp: dict) -> str:
         if name in ("Read", "read"):
-            return f"reading {inp.get('file_path', '?')}"
+            return f"reading {self._shorten_path_text(inp.get('file_path', '?'))}"
         if name in ("Write", "write"):
-            return f"writing {inp.get('file_path', '?')}"
+            return f"writing {self._shorten_path_text(inp.get('file_path', '?'))}"
         if name in ("Edit", "edit"):
-            return f"editing {inp.get('file_path', '?')}"
+            return f"editing {self._shorten_path_text(inp.get('file_path', '?'))}"
         if name in ("Bash", "bash"):
             cmd = inp.get("command", "?")
-            shortened = cmd[:100] + ("..." if len(cmd) > 100 else "")
+            shortened = self._shorten_command(cmd)
             return f"running {shortened}"
         if name in ("Glob", "glob"):
-            return f"scanning {inp.get('pattern', '?')}"
+            return f"scanning {self._shorten_path_text(inp.get('pattern', '?'))}"
         if name in ("Grep", "grep"):
             pattern = inp.get("pattern", "?")
-            path = inp.get("path", "")
+            path = self._shorten_path_text(inp.get("path", ""))
             return f"searching /{pattern}/ {path}".strip()
         if name == "Agent":
             agent = inp.get("agent", "") or inp.get("name", "")
@@ -144,6 +145,47 @@ class SessionTailer:
                 return f"delegating to {agent}: {detail}"
             return f"delegating: {detail}"
         return str(inp)[:80]
+
+    def _shorten_command(self, command: str) -> str:
+        command = self._replace_long_paths(command)
+        return command[:100] + ("..." if len(command) > 100 else "")
+
+    def _shorten_path_text(self, text: str) -> str:
+        text = str(text)
+        project_display = self._project_relative_display(text)
+        if project_display is not None:
+            return project_display
+        if "/" not in text:
+            return text
+        parts = [segment for segment in text.split("/") if segment]
+        if not parts:
+            return text
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return f".../{parts[-1]}"
+        return f".../{parts[-2]}/{parts[-1]}"
+
+    def _replace_long_paths(self, text: str) -> str:
+        path_pattern = re.compile(r"(?P<path>(?:~|/)[^\s'\"`]+)")
+
+        def _rewrite(match: re.Match[str]) -> str:
+            return self._shorten_path_text(match.group("path"))
+
+        return path_pattern.sub(_rewrite, str(text))
+
+    def _project_relative_display(self, text: str) -> str | None:
+        candidate = str(text)
+        try:
+            path = Path(candidate).expanduser().resolve(strict=False)
+        except Exception:
+            return None
+        try:
+            relative = path.relative_to(self._project_dir)
+        except ValueError:
+            return None
+        rel_text = relative.as_posix()
+        return f"./{rel_text}" if rel_text else "."
 
     @staticmethod
     def _emit(text: str) -> None:
@@ -207,6 +249,7 @@ class AgentResult:
 @dataclass
 class TailerActivity:
     actor: str
+    tool_name: str
     summary: str
 
 
@@ -267,6 +310,7 @@ class ClaudeSession:
                 text=True,
                 timeout=self.PREFLIGHT_TIMEOUT_SEC,
                 env=self._subprocess_env,
+                stdin=subprocess.DEVNULL,
             )
         except FileNotFoundError:
             return PreflightResult(
@@ -415,6 +459,7 @@ class ClaudeSession:
                 timeout=invocation.timeout,
                 cwd=str(self.project_dir),
                 env=self._subprocess_env,
+                stdin=subprocess.DEVNULL,
             )
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
@@ -434,6 +479,7 @@ class ClaudeSession:
                     cwd=str(self.project_dir),
                     env=self._subprocess_env,
                     start_new_session=True,
+                    stdin=subprocess.DEVNULL,
                 )
                 start = time.monotonic()
                 stdout = ""

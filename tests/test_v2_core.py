@@ -11,7 +11,7 @@ import yaml
 
 from src.dispatcher.core import BudgetExceededError, Dispatcher
 from src.dispatcher.session import AgentInvocation, AgentResult
-from src.dispatcher.state import PipelineStateFile
+from src.dispatcher.state import PipelineStateFile, PipelineStateMachine
 from src.dispatcher.schemas import ArtifactValidator, ValidationResult
 from src.dispatcher.lanes import LaneManager
 from src.dispatcher.budget import BudgetManager
@@ -130,6 +130,16 @@ class TestValidationRepairPrompt:
         assert "Output contract:" in prompt
         assert "must_pass" in prompt  # semantic rule included
 
+    def test_targets_smallest_possible_correction(self, tmp_path):
+        d = _make_v2_dispatcher(tmp_path)
+        invalid_path = d.feature_dir / "validation-failures" / "plan_fix-attempt-1-input.yaml"
+        invalid_path.parent.mkdir(parents=True, exist_ok=True)
+        invalid_path.write_text("type: plan\n")
+        validation = ValidationResult(valid=False, errors=["bad"])
+        prompt = d._build_repair_prompt("original", "plan", validation, Path("/out.yaml"), repair_source=invalid_path)
+        assert "smallest possible correction" in prompt
+        assert str(invalid_path) in prompt
+
     def test_contract_block_can_be_disabled(self, tmp_path):
         d = _make_v2_dispatcher(tmp_path)
         validation = ValidationResult(valid=False, errors=["bad"])
@@ -201,6 +211,19 @@ class TestBudgetEnforcement:
 
 
 class TestValidationRetryLoop:
+    def test_invalid_prerequisite_artifact_fails_fast(self, tmp_path):
+        d = _make_v2_dispatcher(tmp_path)
+        sm = PipelineStateMachine(d.state_file)
+        bad_plan = d.feature_dir / "plan-v1.yaml"
+        bad_plan.write_text("---\ntype: plan\nsummary: short\n")
+
+        data = d._ensure_valid_yaml_artifact(sm, bad_plan, "plan", "plan-v1.yaml")
+
+        assert data is None
+        state = d.state_file.read()
+        assert state["current_stage"] == "failed"
+        assert state["status"] == "failed"
+
     def test_missing_output_file_is_a_validation_failure(self, tmp_path, monkeypatch):
         d = _make_v2_dispatcher(tmp_path)
         output_path = d.feature_dir / "missing.yaml"
@@ -303,6 +326,31 @@ class TestValidationRetryLoop:
         assert validation.valid
         assert rotate_calls == [("planning", "")]
 
+    def test_stops_early_when_retry_repeats_same_invalid_state(self, tmp_path, monkeypatch):
+        d = _make_v2_dispatcher(tmp_path)
+        attempts = []
+
+        def fake_invoke(prompt, config, stage, task_id=""):
+            attempts.append(prompt)
+            return AgentResult(session_id="s-1", raw_text="bad")
+
+        monkeypatch.setattr(d, "_invoke_stage", fake_invoke)
+        monkeypatch.setattr(
+            d.validator,
+            "validate",
+            lambda raw_text, expected_type: ValidationResult(valid=False, data={"type": "plan"}, errors=["same failure"]),
+        )
+
+        _, validation = d._invoke_validated_stage(
+            prompt="original prompt",
+            config={"pipeline": {"mode": "v2"}, "validation": {"max_retries": 3, "rotate_on_retry": False}},
+            expected_type="plan",
+            stage="planning",
+        )
+
+        assert not validation.valid
+        assert len(attempts) == 3
+
     def test_budget_tightening_reduces_retry_count(self, tmp_path, monkeypatch):
         d = _make_v2_dispatcher(tmp_path)
         d.budget = BudgetManager({"budgets": {"spec_author": 10.0}})
@@ -380,6 +428,63 @@ class TestQualityTierNormalization:
             r = self._validate_manifest_with_tier(tier)
             assert r.valid
             assert r.data["tasks"][0]["quality_tier"] == tier
+
+
+class TestDeterministicArtifactRepair:
+    def test_plan_review_type_alias_is_normalized_without_retry(self):
+        result = ArtifactValidator().validate_data({
+            "type": "plan-review",
+            "plan_version": 1,
+            "verdict": "approve",
+            "confidence": "high",
+            "summary": "This review is valid after normalizing the type alias.",
+            "findings": [],
+        }, "plan_review")
+        assert result.valid
+        assert result.data["type"] == "plan_review"
+        assert result.data["verdict"] == "approved"
+
+    def test_plan_task_suffix_ids_are_repaired_and_dependencies_follow(self):
+        result = ArtifactValidator().validate_data({
+            "type": "plan",
+            "summary": "This is a valid plan summary with enough detail for validation.",
+            "phases": [{
+                "id": "phase-1",
+                "name": "Phase one",
+                "description": "Phase description",
+                "tasks": [
+                    {
+                        "id": "task-001",
+                        "description": "First task in the plan",
+                        "files": ["a.txt"],
+                        "acceptance": ["A valid acceptance criterion"],
+                        "depends_on": [],
+                        "estimated_complexity": "low",
+                    },
+                    {
+                        "id": "task-001a",
+                        "description": "Second task in the plan",
+                        "files": ["b.txt"],
+                        "acceptance": ["Another valid acceptance criterion"],
+                        "depends_on": ["task-001"],
+                        "estimated_complexity": "low",
+                    },
+                    {
+                        "id": "task-002",
+                        "description": "Third task in the plan",
+                        "files": ["c.txt"],
+                        "acceptance": ["Third valid acceptance criterion"],
+                        "depends_on": ["task-001a"],
+                        "estimated_complexity": "low",
+                    },
+                ],
+            }],
+            "risks": [],
+        }, "plan")
+        assert result.valid
+        ids = [task["id"] for task in result.data["phases"][0]["tasks"]]
+        assert ids == ["task-001", "task-002", "task-003"]
+        assert result.data["phases"][0]["tasks"][2]["depends_on"] == ["task-002"]
 
 
 class TestPromptDelegationStripping:

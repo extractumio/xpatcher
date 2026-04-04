@@ -7,7 +7,7 @@ import shlex
 import shutil
 
 
-_SHELL_OPERATOR_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "<<", "&"}
+_SHELL_OPERATOR_TOKENS = {"!", ";", "&&", "||", "|", ">", ">>", "<", "<<", "&"}
 _BASH_ONLY_PATTERNS = (
     re.compile(r"<\("),
     re.compile(r">\("),

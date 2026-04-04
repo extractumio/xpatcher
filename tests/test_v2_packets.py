@@ -49,6 +49,44 @@ class TestRepoInventoryDetection:
         assert "javascript" in inv["primary_languages"]
         assert "npm" in inv["package_managers"]
 
+    def test_detects_nested_workspace_manifests_and_scripts(self, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "health-dashboard" / "frontend").mkdir(parents=True)
+        (project_dir / "health-dashboard" / "backend").mkdir(parents=True)
+        (project_dir / "health-dashboard" / "frontend" / "package.json").write_text("{}")
+        (project_dir / "health-dashboard" / "frontend" / "vite.config.ts").write_text("export default {};\n")
+        (project_dir / "health-dashboard" / "backend" / "requirements.txt").write_text("fastapi\n")
+        (project_dir / "health-dashboard" / "start.sh").write_text("#!/bin/bash\n")
+        feature_dir = tmp_path / "feature"
+        feature_dir.mkdir()
+
+        inv = ContextManager(feature_dir, project_dir).build_repo_inventory()
+
+        assert "npm" in inv["package_managers"]
+        manifest_paths = {item["path"] for item in inv["workspace_manifests"]}
+        assert "health-dashboard/frontend/package.json" in manifest_paths
+        assert "health-dashboard/backend/requirements.txt" in inv["key_configs"]
+        assert "health-dashboard/frontend/vite.config.ts" in inv["key_configs"]
+        assert "health-dashboard/start.sh" in inv["notable_scripts"]
+
+    def test_inventory_excludes_data_and_backup_paths(self, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "data" / "greg").mkdir(parents=True)
+        (project_dir / "data" / "greg" / "CLAUDE.md").write_text("private\n")
+        (project_dir / "data_backup_20260329" / "greg").mkdir(parents=True)
+        (project_dir / "data_backup_20260329" / "greg" / "CLAUDE.md").write_text("backup\n")
+        (project_dir / "health-dashboard").mkdir()
+        (project_dir / "health-dashboard" / "start.sh").write_text("#!/bin/bash\n")
+        feature_dir = tmp_path / "feature"
+        feature_dir.mkdir()
+
+        inv = ContextManager(feature_dir, project_dir).build_repo_inventory()
+
+        assert all("data/" not in path for path in inv.get("key_configs", []))
+        assert all("data_backup" not in path for path in inv.get("key_configs", []))
+
 
 class TestBootstrapContext:
     def test_bootstrap_creates_all_artifacts_and_they_are_loadable(self, tmp_path):
@@ -65,6 +103,23 @@ class TestBootstrapContext:
         assert not mgr.has_bootstrap_context()
         mgr.build_bootstrap_context("Test")
         assert mgr.has_bootstrap_context()
+
+    def test_bootstrap_includes_implementation_scout(self, tmp_path):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        (project_dir / "health-dashboard").mkdir()
+        (project_dir / "health-dashboard" / "start.sh").write_text("#!/usr/bin/env bash\necho start\n")
+        (project_dir / "health-dashboard" / "frontend").mkdir(parents=True)
+        (project_dir / "health-dashboard" / "frontend" / "package.json").write_text("{\"name\":\"frontend\"}\n")
+        feature_dir = tmp_path / "feature"
+        feature_dir.mkdir()
+        mgr = ContextManager(feature_dir, project_dir)
+
+        artifacts = mgr.build_bootstrap_context("Dockerize app")
+        scout = yaml.safe_load(artifacts["implementation_scout"].read_text())
+
+        assert scout["type"] == "implementation_scout"
+        assert scout["entries"]
 
 
 class TestFeatureBriefBridging:

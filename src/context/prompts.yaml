@@ -7,8 +7,15 @@ templates:
     Feature request: $description
 
     Project directory: $project_dir
+    Bootstrap context artifacts, if present:
+    - $feature_dir/context/feature-brief.yaml
+    - $feature_dir/context/repo-inventory.yaml
 
     Output a YAML intent document conforming to the IntentOutput schema with: goal, scope, constraints, and any clarifying questions.
+    Use the bootstrap context artifacts first. Do not perform repository exploration for this stage.
+    Do not read project source, config, or script files outside the bootstrap context artifacts.
+    If the request remains ambiguous after reading the bootstrap context artifacts, capture that ambiguity as clarifying questions instead of exploring further.
+    Do not use the Agent tool for this stage.
 
     Schema rules:
     - Use `type: intent`
@@ -25,8 +32,21 @@ templates:
     Task for the planner: Create a thorough executable specification based on the intent at: $intent_path
 
     Project directory: $project_dir
+    Stable context artifacts:
+    - $feature_dir/context/feature-brief.yaml
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/implementation-scout.yaml
 
-    Read the intent, explore the codebase, and produce a structured YAML plan conforming to the PlanOutput schema.
+    Read the intent and stable context artifacts first, especially implementation-scout.yaml.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Inspect at most 6 additional project files beyond the provided context artifacts unless a concrete ambiguity requires one more.
+    Start from the file paths already named in implementation-scout.yaml and repo-inventory.yaml before searching elsewhere.
+    Then inspect only the files that materially affect implementation.
+    Produce a structured YAML plan conforming to the PlanOutput schema.
+    Use Read, Grep, and Glob to inspect only the relevant code, config, and existing xpatcher artifacts before writing.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files. Planning must not depend on secret values.
+    If an existing artifact already covers most of the work, update it intelligently instead of regenerating it from scratch.
+    Do not use the Agent tool for this stage.
 
     Required PlanOutput schema structure:
     - type: plan
@@ -45,6 +65,14 @@ templates:
     Original intent at: $intent_path
 
     Verify feasibility by checking that referenced files, modules, packages, entry points, configs, and commands actually make sense in: $project_dir.
+    Read stable context artifacts first when present:
+    - $feature_dir/context/feature-brief.yaml
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/implementation-scout.yaml
+    Start with structural and executable checks. Inspect only the files needed to validate concrete claims in the plan.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files.
+    Do not use the Agent tool for this stage.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
@@ -54,8 +82,24 @@ templates:
 
     Task for the planner: Revise the executable specification at: $plan_path
     Based on review findings at: $review_path
+    Stable context artifacts:
+    - $feature_dir/context/feature-brief.yaml
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/implementation-scout.yaml
 
-    Address all critical and major findings. Strengthen missing behavioral detail, edge cases, compatibility concerns, and verification steps.
+    Read the existing artifact first. Use Read, Grep, Glob, and targeted Edit operations on xpatcher artifact files when a localized correction is sufficient.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files.
+
+    Address all critical and major findings with the smallest reasonable set of edits.
+    Treat this as updating an existing artifact, not regenerating it from scratch.
+    Preserve unchanged phases, task ordering, task IDs, wording, and rationale unless a finding requires a change.
+    Prefer:
+    - amending an existing task over creating a new task
+    - appending a missing acceptance item over rewriting the whole task
+    - editing notes, dependencies, or risk entries in place over broad plan reshaping
+    Only add or remove tasks when the review findings make that necessary.
+    Do not use the Agent tool for this stage.
 
     IMPORTANT — the output must conform to PlanOutput schema exactly:
     - type: plan
@@ -71,6 +115,14 @@ templates:
     Delegate this task to @agent-planner — do NOT do this work yourself, you MUST use the Agent tool to spawn the planner subagent.
 
     Task for the planner: Decompose the approved specification at: $plan_path into execution slices.
+    Stable context artifacts:
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/manifest-packet-v1.yaml
+    - $feature_dir/context/implementation-scout.yaml
+    Use Read, Grep, and Glob to inspect the approved plan, stable context artifacts, and any existing task artifacts before writing.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files.
+    Do not use the Agent tool for this stage.
 
     If the specification describes a single cohesive change, produce a manifest with ONE task. Only decompose when genuinely needed.
 
@@ -91,8 +143,16 @@ templates:
     Task for the plan-reviewer: Review the execution-slice breakdown at: $manifest_path
 
     Verify tasks cover the full specification, each has a single clear responsibility, and every task has at least one must_pass command-based criterion.
+    Read stable context artifacts first when present:
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/manifest-packet-v1.yaml
+    - $feature_dir/context/implementation-scout.yaml
+    Start with schema, dependency, and command executability checks before broad semantic review.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files.
 
     Reject the manifest if any task lacks a must_pass command-based acceptance criterion.
+    Do not use the Agent tool for this stage.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the YAML review to: $output_path
@@ -102,8 +162,20 @@ templates:
 
     Task for the planner: Revise the task manifest at: $manifest_path
     Based on review findings at: $review_path
+    Stable context artifacts:
+    - $feature_dir/context/repo-inventory.yaml
+    - $feature_dir/context/manifest-packet-v1.yaml
+    - $feature_dir/context/implementation-scout.yaml
 
-    Address all critical and major findings. Every task must have at least one concrete must_pass command in acceptance_criteria[].command.
+    Read the existing manifest first. Use Read, Grep, Glob, and targeted Edit operations on xpatcher artifact files when a localized correction is sufficient.
+    Do not enumerate the repository broadly. Avoid recursive codebase globs like `**/*.py` or `**/*`.
+    Never read secrets or host-local data such as `.env*`, `data/`, `data_backup_*`, private keys, certificates, or credential files.
+
+    Address all critical and major findings with targeted edits instead of regenerating the manifest.
+    Preserve unchanged task IDs, titles, ordering, descriptions, and dependencies unless a finding requires changing them.
+    Prefer editing existing tasks in place. Add, split, merge, or remove tasks only when the findings make that necessary.
+    Every task must have at least one concrete must_pass command in acceptance_criteria[].command.
+    Do not use the Agent tool for this stage.
 
     Time constraint: current time is $current_time. You have a hard limit of $timeout_minutes minutes. Write the output file BEFORE doing any optional verification. Do not spend time on validation scripts or re-reading the output — write it and stop.
     Write the revised task manifest as YAML to: $output_path

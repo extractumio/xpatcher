@@ -45,8 +45,10 @@ def _make_home(tmp_path: Path) -> Path:
     return home
 
 
-def _feature_dir(dispatcher: Dispatcher, feature_slug: str) -> Path:
-    return dispatcher._feature_dir_for(feature_slug)
+def _latest_feature_dir(home: Path, feature_slug: str) -> Path:
+    matches = sorted((home / ".xpatcher").glob(f"projects/*/{feature_slug}--xp-*"))
+    assert matches
+    return matches[-1]
 
 
 def _result(text: str, session_id: str) -> AgentResult:
@@ -70,6 +72,11 @@ def test_full_pipeline_completes_and_moves_task_artifacts(tmp_path, monkeypatch)
     project_dir = _make_repo(tmp_path)
     home = _make_home(tmp_path)
     dispatcher = Dispatcher(project_dir, home)
+    monkeypatch.setattr(
+        "src.dispatcher.core.subprocess.run",
+        lambda *args, **kwargs: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(dispatcher, "_require_auth", lambda: None)
 
     monkeypatch.setattr(dispatcher.session, "preflight", lambda: PreflightResult(ok=True, cli_version="2.1.87", plugin_loaded=True))
     monkeypatch.setattr(dispatcher.tui, "prompt_approval", lambda prompt: True)
@@ -118,7 +125,7 @@ def test_full_pipeline_completes_and_moves_task_artifacts(tmp_path, monkeypatch)
 
     dispatcher.start("Add a farewell helper with tests")
 
-    feature_dir = _feature_dir(dispatcher, "add-a-farewell-helper-with-tests")
+    feature_dir = _latest_feature_dir(home, "add-a-farewell-helper-with-tests")
     state = yaml.safe_load((feature_dir / "pipeline-state.yaml").read_text())
     assert state["current_stage"] == "done"
     assert state["task_states"]["task-001"] == "succeeded"
@@ -132,6 +139,11 @@ def test_gap_reentry_creates_new_manifest_and_gap_task(tmp_path, monkeypatch):
     project_dir = _make_repo(tmp_path)
     home = _make_home(tmp_path)
     dispatcher = Dispatcher(project_dir, home)
+    monkeypatch.setattr(
+        "src.dispatcher.core.subprocess.run",
+        lambda *args, **kwargs: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(dispatcher, "_require_auth", lambda: None)
 
     monkeypatch.setattr(dispatcher.session, "preflight", lambda: PreflightResult(ok=True, cli_version="2.1.87", plugin_loaded=True))
     monkeypatch.setattr(dispatcher.tui, "prompt_approval", lambda prompt: True)
@@ -158,7 +170,7 @@ def test_gap_reentry_creates_new_manifest_and_gap_task(tmp_path, monkeypatch):
 
     dispatcher.start("Add a farewell helper with tests")
 
-    feature_dir = _feature_dir(dispatcher, "add-a-farewell-helper-with-tests")
+    feature_dir = _latest_feature_dir(home, "add-a-farewell-helper-with-tests")
     state = yaml.safe_load((feature_dir / "pipeline-state.yaml").read_text())
     assert state["current_stage"] == "done"
     assert (feature_dir / "task-manifest-v2.yaml").exists()

@@ -7,6 +7,7 @@ registry maps artifact type strings to their Pydantic model classes.
 from __future__ import annotations
 
 from enum import Enum
+import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -83,6 +84,60 @@ COMPLEXITY_ALIASES = {
     "moderate": Complexity.MEDIUM,
     "complex": Complexity.HIGH,
 }
+
+_TASK_ID_RE = re.compile(TASK_ID_PATTERN)
+_TASK_ID_SUFFIX_RE = re.compile(r"^task-([A-Z]?\d{3})[A-Za-z]+$")
+
+
+def _next_task_id(used_ids: set[str]) -> str:
+    max_num = 0
+    for task_id in used_ids:
+        digits = re.search(r"(\d{3})$", task_id)
+        if digits:
+            max_num = max(max_num, int(digits.group(1)))
+
+    while True:
+        max_num += 1
+        candidate = f"task-{max_num:03d}"
+        if candidate not in used_ids:
+            used_ids.add(candidate)
+            return candidate
+
+
+def _normalize_task_id_collection(tasks: list[dict[str, Any]]) -> None:
+    """Repair common task-id mistakes cheaply and update local references."""
+    if not isinstance(tasks, list):
+        return
+
+    used_ids: set[str] = set()
+    raw_to_new: dict[str, str] = {}
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        raw_id = str(task.get("id", "")).strip()
+        if not raw_id:
+            task["id"] = _next_task_id(used_ids)
+            continue
+
+        if _TASK_ID_RE.match(raw_id) and raw_id not in used_ids:
+            used_ids.add(raw_id)
+            continue
+
+        if raw_id in raw_to_new:
+            task["id"] = raw_to_new[raw_id]
+            continue
+
+        if _TASK_ID_SUFFIX_RE.match(raw_id) or raw_id.startswith("task-"):
+            task["id"] = _next_task_id(used_ids)
+            raw_to_new[raw_id] = task["id"]
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        depends_on = task.get("depends_on")
+        if isinstance(depends_on, list):
+            task["depends_on"] = [raw_to_new.get(str(dep).strip(), dep) for dep in depends_on]
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +595,8 @@ class ArtifactValidator:
             data["type"] = data["kind"]
         # Common type name mismatches
         _TYPE_ALIASES = {
+            "plan-review": "plan_review",
+            "task-manifest-review": "task_manifest_review",
             "task_review": "task_manifest_review",
             "manifest_review": "task_manifest_review",
             "execution_output": "execution_result",
@@ -588,8 +645,10 @@ class ArtifactValidator:
             # Ensure lists default
             data.setdefault("constraints", [])
             data.setdefault("clarifying_questions", [])
+            _list_items_to_strings(data, "scope", preferred_keys=("text", "description", "title", "name"))
+            _list_items_to_strings(data, "constraints", preferred_keys=("text", "description", "title", "name"))
             # clarifying_questions may be dicts
-            _list_of_dicts_to_strings(data, "clarifying_questions", "question")
+            _list_items_to_strings(data, "clarifying_questions", preferred_keys=("question", "text", "description", "title"))
 
         # ── All review types ─────────────────────────────────────────────
         if artifact_type in {"review", "plan_review", "task_manifest_review"}:
@@ -741,7 +800,8 @@ class ArtifactValidator:
             for phase in data.get("phases", []):
                 if not isinstance(phase, dict):
                     continue
-                for task in phase.get("tasks", []):
+                tasks = phase.get("tasks", [])
+                for task in tasks:
                     if not isinstance(task, dict):
                         continue
                     # Field renames
@@ -768,6 +828,7 @@ class ArtifactValidator:
                     acceptance = task.get("acceptance")
                     if isinstance(acceptance, list):
                         task["acceptance"] = _flatten_acceptance_list(acceptance)
+                _normalize_task_id_collection(tasks)
 
         # ── Task Manifest ────────────────────────────────────────────────
         if artifact_type == "task_manifest":
@@ -821,6 +882,7 @@ class ArtifactValidator:
                 task.setdefault("notes", "")
                 # Complexity aliases
                 _rename_key(task, "complexity", "estimated_complexity")
+            _normalize_task_id_collection(data.get("tasks", []))
 
         # ── Execution Result ─────────────────────────────────────────────
         if artifact_type == "execution_result":
@@ -1000,6 +1062,47 @@ def _list_of_dicts_to_strings(data: dict, field: str, text_key: str) -> None:
             item.get(text_key, str(item)) if isinstance(item, dict) else str(item)
             for item in items
         ]
+
+
+def _stringify_list_item(item: Any, preferred_keys: tuple[str, ...] = ()) -> str:
+    """Best-effort conversion of mixed YAML list items into readable strings."""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        for key in preferred_keys:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if len(item) == 1:
+            key, value = next(iter(item.items()))
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            key_text = str(key).strip()
+            if key_text:
+                return key_text
+        parts = []
+        for key, value in item.items():
+            key_text = str(key).strip()
+            value_text = str(value).strip()
+            if key_text and value_text and value_text not in {"None", "null", "{}"}:
+                parts.append(f"{key_text}: {value_text}")
+            elif key_text:
+                parts.append(key_text)
+            elif value_text and value_text not in {"None", "null", "{}"}:
+                parts.append(value_text)
+        return "; ".join(part for part in parts if part)
+    return str(item).strip()
+
+
+def _list_items_to_strings(data: dict, field: str, preferred_keys: tuple[str, ...] = ()) -> None:
+    """Coerce mixed list items to strings while preserving ordering."""
+    items = data.get(field)
+    if not isinstance(items, list):
+        return
+    data[field] = [
+        text for text in (_stringify_list_item(item, preferred_keys) for item in items)
+        if text
+    ]
 
 
 def _flatten_acceptance_list(items: list) -> list[str]:

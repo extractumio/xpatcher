@@ -55,6 +55,35 @@ class TestClaudeSessionExtractYaml:
         assert result is None
 
 
+class TestSessionTailerSummaries:
+    def test_tool_summary_shortens_long_file_paths(self):
+        from src.dispatcher.session import SessionTailer
+
+        tailer = SessionTailer(Path("/Users/greg/project"), "sess-1", emit_debug=False)
+        summary = tailer._tool_summary("Read", {"file_path": "/Users/greg/project/scripts/task-001.yaml"})
+        assert summary == "reading ./scripts/task-001.yaml"
+
+    def test_tool_summary_shortens_paths_inside_bash_commands(self):
+        from src.dispatcher.session import SessionTailer
+
+        tailer = SessionTailer(Path("/Users/greg/project"), "sess-1", emit_debug=False)
+        summary = tailer._tool_summary("Bash", {"command": "cat /Users/greg/project/.xpatcher/context/feature-brief.yaml"})
+        assert "./.xpatcher/context/feature-brief.yaml" in summary
+
+    def test_tool_summary_keeps_non_project_paths_compact(self):
+        from src.dispatcher.session import SessionTailer
+
+        tailer = SessionTailer(Path("/Users/greg/project"), "sess-1", emit_debug=False)
+        summary = tailer._tool_summary("Read", {"file_path": "/tmp/generated/output.yaml"})
+        assert summary == "reading .../generated/output.yaml"
+
+    def test_tailer_activity_carries_tool_name(self):
+        from src.dispatcher.session import TailerActivity
+
+        activity = TailerActivity(actor="executor", tool_name="Bash", summary="running pytest -q")
+        assert activity.tool_name == "Bash"
+
+
 # ===========================================================================
 # ClaudeSession.invoke — command construction
 # ===========================================================================

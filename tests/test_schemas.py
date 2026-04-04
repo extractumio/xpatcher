@@ -108,6 +108,13 @@ class TestSchemaContracts:
         assert result.valid is False
         assert "invalid python -c program" in result.errors[0]
 
+    def test_task_manifest_accepts_shell_negation_command(self):
+        data = _task_manifest_data()
+        data["tasks"][0]["acceptance_criteria"][0]["command"] = "! grep -q forbidden settings.py"
+        validator = ArtifactValidator()
+        result = validator.validate_data(data, expected_type="task_manifest")
+        assert result.valid is True
+
     def test_task_manifest_rejects_empty_task_list(self):
         data = _task_manifest_data()
         data["tasks"] = []
@@ -162,6 +169,39 @@ class TestValidatorRouting:
         assert result.data["type"] == "intent"
         assert result.data["scope"] == ["Add farewell helper", "Add tests"]
         assert "Out of scope: No CLI changes" in result.data["constraints"]
+
+    def test_validator_repairs_dict_items_inside_intent_lists(self):
+        validator = ArtifactValidator()
+        result = validator.validate_data(
+            {
+                "type": "intent",
+                "goal": "Create a docker workflow for the project with safe host-mounted persistence",
+                "scope": [
+                    {"Dockerfile for the web app": None},
+                    {"description": "docker-compose file with bind mounts"},
+                ],
+                "constraints": [
+                    {"text": "Do not bake secrets into the image"},
+                    {"Non-root runtime user": None},
+                ],
+                "clarifying_questions": [
+                    {"question": "Should this support local dev hot reload?"},
+                ],
+            },
+            expected_type="intent",
+        )
+        assert result.valid is True
+        assert result.data["scope"] == [
+            "Dockerfile for the web app",
+            "docker-compose file with bind mounts",
+        ]
+        assert result.data["constraints"] == [
+            "Do not bake secrets into the image",
+            "Non-root runtime user",
+        ]
+        assert result.data["clarifying_questions"] == [
+            "Should this support local dev hot reload?",
+        ]
 
     def test_validator_normalizes_numeric_review_confidence(self):
         validator = ArtifactValidator()

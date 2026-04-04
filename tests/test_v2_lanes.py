@@ -60,13 +60,13 @@ class TestLaneContinuity:
         assert sid1 == sid2
         assert resume
 
-    def test_intent_capture_shares_lane_with_planning(self, tmp_path):
-        """Intent and planning are both spec authoring — same conversation."""
+    def test_intent_capture_is_isolated_from_planning(self, tmp_path):
+        """Intent capture should not contaminate planning with a reused conversation."""
         mgr = LaneManager(tmp_path / "f")
         sid1, _ = mgr.resolve_session("intent_capture")
         sid2, resume = mgr.resolve_session("planning")
-        assert sid1 == sid2
-        assert resume
+        assert sid1 != sid2
+        assert not resume
 
 
 class TestLaneRotation:

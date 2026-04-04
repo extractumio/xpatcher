@@ -19,7 +19,7 @@ from .auth import resolve_auth_env, describe_auth_source
 from .command_validation import prepare_acceptance_command
 from .state import PipelineStage, PipelineStateFile, PipelineStateMachine, TaskDAG, TaskState
 from .session import AgentInvocation, AgentResult, ClaudeSession, SessionTailer
-from .schemas import ArtifactValidator, ValidationResult
+from .schemas import ArtifactValidator, SCHEMAS, TaskDefinition, ValidationResult
 from .lanes import LaneManager
 from .budget import BudgetManager
 from .tui import TUIRenderer
@@ -62,8 +62,8 @@ def _project_storage_slug(project_dir: Path) -> str:
     return f"{project_slug}-{digest}"
 
 
-def _branch_name_for(feature_slug: str) -> str:
-    return f"xpatcher/{feature_slug}"
+def _branch_name_for(feature_slug: str, pipeline_id: str) -> str:
+    return f"xpatcher/{feature_slug}-{pipeline_id}"
 
 
 def _home_relative(path: Path) -> str:
@@ -159,8 +159,11 @@ class Dispatcher:
             sys.exit(1)
         self.tui.success(f"Auth: {label}")
 
-    def _feature_dir_for(self, feature_slug: str) -> Path:
-        return self.xpatcher_home / ".xpatcher" / "projects" / _project_storage_slug(self.project_dir) / feature_slug
+    def _feature_dir_for(self, feature_slug: str, pipeline_id: str | None = None) -> Path:
+        base = self.xpatcher_home / ".xpatcher" / "projects" / _project_storage_slug(self.project_dir)
+        if pipeline_id:
+            return base / f"{feature_slug}--{pipeline_id}"
+        return base / feature_slug
 
     def start(self, description: str, verbose: bool = False, debug: bool = False):
         """Start a new pipeline."""
@@ -188,8 +191,8 @@ class Dispatcher:
 
         pipeline_id = generate_pipeline_id()
         feature_slug = _slugify(description)
-        branch_name = _branch_name_for(feature_slug)
-        feature_dir = self._feature_dir_for(feature_slug)
+        branch_name = _branch_name_for(feature_slug, pipeline_id)
+        feature_dir = self._feature_dir_for(feature_slug, pipeline_id)
         self._initialize_feature_dir(feature_dir)
 
         state_file = PipelineStateFile(str(feature_dir / "pipeline-state.yaml"))
@@ -203,6 +206,7 @@ class Dispatcher:
             "total_cost_usd": 0.0,
             "branch_name": branch_name,
             "branch_created_at": _now_iso(),
+            "dispatcher_pid": os.getpid(),
             "task_states": {},
             "iterations": {
                 "plan_review": {"current": 0, "max": 0, "history": []},
@@ -237,11 +241,15 @@ class Dispatcher:
             if self._use_bootstrap_artifacts(config):
                 self.context_mgr = ContextManager(feature_dir, self.project_dir)
 
-        subprocess.run(
+        branch_result = subprocess.run(
             ["git", "checkout", "-b", branch_name],
             cwd=str(self.project_dir),
             capture_output=True,
+            text=True,
         )
+        if branch_result.returncode != 0:
+            self.tui.error(f"Failed to create branch {branch_name}: {branch_result.stderr.strip()}")
+            sys.exit(1)
 
         self.tui.configure_live_dashboard(self._use_live_dashboard(config))
         self.tui.set_pipeline(pipeline_id, description)
@@ -254,6 +262,9 @@ class Dispatcher:
             self.tui.warning(f"Pipeline {pipeline_id} was cancelled. Dispatcher exited cleanly.")
         except KeyboardInterrupt:
             self._handle_interrupt(sm, pipeline_id)
+        except Exception as exc:
+            self._fail_pipeline(sm, f"Unhandled dispatcher error: {exc}")
+            raise
 
     # Stages that --from-stage accepts, mapped to the pipeline method entry points
     _RESUMABLE_STAGES = {
@@ -367,6 +378,10 @@ class Dispatcher:
         except KeyboardInterrupt:
             sm = PipelineStateMachine(self.state_file)
             self._handle_interrupt(sm, pipeline_id)
+        except Exception as exc:
+            sm = PipelineStateMachine(self.state_file)
+            self._fail_pipeline(sm, f"Unhandled dispatcher error: {exc}")
+            raise
 
     def _resume_from_stage(self, from_stage: str, feature_dir: Path, config: dict, state: dict):
         """Resume pipeline execution from a specific stage, reusing existing artifacts."""
@@ -733,6 +748,13 @@ class Dispatcher:
 
         for iteration in range(1, max_iterations + 1):
             self._raise_if_cancelled()
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / f"plan-v{plan_version}.yaml",
+                "plan",
+                f"plan-v{plan_version}.yaml",
+            ) is None:
+                return None
             sm.transition(PipelineStage.PLAN_REVIEW)
             self.tui.stage(f"Stage 3: Plan Review (iteration {iteration})", stage_key=PipelineStage.PLAN_REVIEW.value)
             review_out = self.feature_dir / f"plan-review-v{plan_version}.yaml"
@@ -767,6 +789,13 @@ class Dispatcher:
             sm.transition(PipelineStage.PLAN_FIX)
             self.tui.stage("Stage 4: Plan Fix", stage_key=PipelineStage.PLAN_FIX.value)
             plan_version += 1
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / f"plan-review-v{plan_version - 1}.yaml",
+                "plan_review",
+                f"plan-review-v{plan_version - 1}.yaml",
+            ) is None:
+                return None
             plan_fix_out = self.feature_dir / f"plan-v{plan_version}.yaml"
             _, plan_validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_plan_fix(plan_version - 1, plan_fix_out, self._stage_timeout(config)),
@@ -795,6 +824,13 @@ class Dispatcher:
         self._raise_if_cancelled()
         if plan_version is None:
             plan_version = store.latest_version("plan")
+        if self._ensure_valid_yaml_artifact(
+            sm,
+            self.feature_dir / f"plan-v{plan_version}.yaml",
+            "plan",
+            f"plan-v{plan_version}.yaml",
+        ) is None:
+            return False
 
         if transition_stage:
             sm.transition(PipelineStage.PLAN_APPROVAL)
@@ -832,6 +868,13 @@ class Dispatcher:
     ) -> int | None:
         del gap_round
         self._raise_if_cancelled()
+        if self._ensure_valid_yaml_artifact(
+            sm,
+            self.feature_dir / f"plan-v{plan_version}.yaml",
+            "plan",
+            f"plan-v{plan_version}.yaml",
+        ) is None:
+            return None
         sm.transition(PipelineStage.TASK_BREAKDOWN)
         self.tui.stage("Stage 6: Execution Slice Breakdown", stage_key=PipelineStage.TASK_BREAKDOWN.value)
         manifest_out = self.feature_dir / "task-manifest.yaml"
@@ -857,6 +900,13 @@ class Dispatcher:
         current_manifest_version = manifest_version
         for iteration in range(1, max_iterations + 1):
             self._raise_if_cancelled()
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / "task-manifest.yaml",
+                "task_manifest",
+                "task-manifest.yaml",
+            ) is None:
+                return None
             sm.transition(PipelineStage.TASK_REVIEW)
             self.tui.stage(f"Stage 7: Execution Slice Review (iteration {iteration})", stage_key=PipelineStage.TASK_REVIEW.value)
             task_review_out = self.feature_dir / f"task-review-v{iteration}.yaml"
@@ -891,6 +941,13 @@ class Dispatcher:
             sm.transition(PipelineStage.TASK_FIX)
             self.tui.stage(f"Stage 8: Execution Slice Fix (iteration {iteration})", stage_key=PipelineStage.TASK_FIX.value)
             current_manifest_version += 1
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / f"task-review-v{iteration}.yaml",
+                "task_manifest_review",
+                f"task-review-v{iteration}.yaml",
+            ) is None:
+                return None
             task_fix_out = self.feature_dir / "task-manifest.yaml"
             _, manifest_validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_task_fix(iteration, task_fix_out, self._stage_timeout(config)),
@@ -917,6 +974,13 @@ class Dispatcher:
         self._raise_if_cancelled()
         sm.transition(PipelineStage.PRIORITIZATION)
         self.tui.stage("Stage 9: Spec-Derived Prioritization", stage_key=PipelineStage.PRIORITIZATION.value)
+        if self._ensure_valid_yaml_artifact(
+            sm,
+            self.feature_dir / "task-manifest.yaml",
+            "task_manifest",
+            "task-manifest.yaml",
+        ) is None:
+            return False
 
         manifest = store.load("task-manifest.yaml")
         tasks = manifest.get("tasks", [])
@@ -975,6 +1039,13 @@ class Dispatcher:
         self.tui.stage(f"Stage 11: Executing {task_id}", stage_key=PipelineStage.TASK_EXECUTION.value, task_id=task_id)
         self._update_task_state(task_id, TaskState.RUNNING)
         task_path = self._move_task_artifact(task_id, "todo", "in-progress")
+        if task_path is None:
+            self._fail_pipeline(sm, f"Task artifact missing for {task_id}")
+            self._update_task_state(task_id, TaskState.FAILED)
+            return False
+        if self._ensure_valid_task_artifact(sm, task_path, task_id) is None:
+            self._update_task_state(task_id, TaskState.FAILED)
+            return False
 
         exec_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-execution-log.yaml"
         exec_out.parent.mkdir(parents=True, exist_ok=True)
@@ -1018,7 +1089,10 @@ class Dispatcher:
     def _run_quality_loop(self, task_id, config, prompt_builder, store, sm):
         max_iterations = config.get("iterations", {}).get("quality_loop_max", 3)
         seen_finding_hashes: set[str] = set()
-        task_spec = self._load_task_spec(task_id)
+        task_spec = self._ensure_valid_task_spec(sm, task_id)
+        if task_spec is None:
+            self._update_task_state(task_id, TaskState.FAILED)
+            return False
 
         for iteration in range(1, max_iterations + 1):
             self._raise_if_cancelled()
@@ -1042,13 +1116,22 @@ class Dispatcher:
                 sm.transition(PipelineStage.FIX_ITERATION)
                 self._update_task_state(task_id, TaskState.NEEDS_FIX)
                 fix_out = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
-                self._invoke_stage(
+                _, fix_validation = self._invoke_validated_stage(
                     prompt=prompt_builder.build_executor_fix(task_id, [{"description": "; ".join(test_report["regression_failures"])}], fix_out, self._stage_timeout(config)),
                     config=config,
+                    expected_type="execution_result",
                     stage=PipelineStage.FIX_ITERATION.value,
                     task_id=task_id,
+                    output_path=fix_out,
                 )
+                if not fix_validation.valid:
+                    self._update_task_state(task_id, TaskState.FAILED)
+                    return False
                 sm.transition(PipelineStage.PER_TASK_QUALITY)
+                task_spec = self._ensure_valid_task_spec(sm, task_id)
+                if task_spec is None:
+                    self._update_task_state(task_id, TaskState.FAILED)
+                    return False
                 continue
 
             self.tui.stage(f"Stage 12: Reviewing {task_id} Against the Specification (iteration {iteration})", stage_key=PipelineStage.PER_TASK_QUALITY.value, task_id=task_id)
@@ -1084,13 +1167,22 @@ class Dispatcher:
             sm.transition(PipelineStage.FIX_ITERATION)
             self._update_task_state(task_id, TaskState.NEEDS_FIX)
             fix_out2 = self.feature_dir / "tasks" / "in-progress" / f"{task_id}-fix-result.yaml"
-            self._invoke_stage(
+            _, fix_validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_executor_fix(task_id, review_validation.data.get("findings", []), fix_out2, self._stage_timeout(config)),
                 config=config,
+                expected_type="execution_result",
                 stage=PipelineStage.FIX_ITERATION.value,
                 task_id=task_id,
+                output_path=fix_out2,
             )
+            if not fix_validation.valid:
+                self._update_task_state(task_id, TaskState.FAILED)
+                return False
             sm.transition(PipelineStage.PER_TASK_QUALITY)
+            task_spec = self._ensure_valid_task_spec(sm, task_id)
+            if task_spec is None:
+                self._update_task_state(task_id, TaskState.FAILED)
+                return False
 
         self._update_task_state(task_id, TaskState.STUCK)
         return False
@@ -1110,6 +1202,13 @@ class Dispatcher:
             self._raise_if_cancelled()
             sm.transition(PipelineStage.GAP_DETECTION)
             self.tui.stage("Stage 14: Specification-to-Code Gap Detection", stage_key=PipelineStage.GAP_DETECTION.value)
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / "task-manifest.yaml",
+                "task_manifest",
+                "task-manifest.yaml",
+            ) is None:
+                return False
             gap_out = self.feature_dir / f"gap-report-v{depth + 1}.yaml"
             _, validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_gap_detector(gap_out, self._stage_timeout(config)),
@@ -1186,6 +1285,13 @@ class Dispatcher:
             self._save_task_manifest(store, merged_manifest, new_manifest_version)
 
             sm.transition(PipelineStage.TASK_REVIEW)
+            if self._ensure_valid_yaml_artifact(
+                sm,
+                self.feature_dir / "task-manifest.yaml",
+                "task_manifest",
+                "task-manifest.yaml",
+            ) is None:
+                return False
             gap_review_out = self.feature_dir / f"task-review-v{new_manifest_version}.yaml"
             _, review_validation = self._invoke_validated_stage(
                 prompt=prompt_builder.build_task_reviewer(gap_review_out, self._stage_timeout(config)),
@@ -1249,6 +1355,68 @@ class Dispatcher:
         """Return the configured timeout (seconds) for stage invocations."""
         return config.get("main_agent", {}).get("timeout", 900)
 
+    def _ensure_valid_yaml_artifact(
+        self,
+        sm: PipelineStateMachine,
+        path: Path,
+        expected_type: str,
+        label: str,
+    ) -> dict | None:
+        """Fail fast when a prerequisite artifact is missing or invalid."""
+        if expected_type not in SCHEMAS:
+            self._fail_pipeline(sm, f"Unknown schema for prerequisite {label}: {expected_type}")
+            return None
+        if not path.exists():
+            self._fail_pipeline(sm, f"Required artifact missing before continuing: {label} at {path}")
+            return None
+        raw_text = path.read_text()
+        if not raw_text.strip():
+            self._fail_pipeline(sm, f"Required artifact is empty before continuing: {label} at {path}")
+            return None
+        validation = self.validator.validate(raw_text, expected_type)
+        if not validation.valid:
+            self._fail_pipeline(sm, f"Invalid prerequisite artifact {label}: {validation.errors}")
+            return None
+        return validation.data
+
+    def _ensure_valid_task_artifact(
+        self,
+        sm: PipelineStateMachine,
+        path: Path,
+        task_id: str,
+    ) -> dict | None:
+        if not path.exists():
+            self._fail_pipeline(sm, f"Required task artifact missing for {task_id}: {path}")
+            return None
+        try:
+            task_data = load_yaml_file(path)
+        except Exception as exc:
+            self._fail_pipeline(sm, f"Failed to parse task artifact for {task_id}: {exc}")
+            return None
+        wrapper = {
+            "type": "task_manifest",
+            "plan_version": 1,
+            "summary": f"Validation wrapper for {task_id}",
+            "tasks": [task_data],
+        }
+        validation = self.validator.validate_data(wrapper, "task_manifest")
+        if not validation.valid:
+            self._fail_pipeline(sm, f"Invalid task artifact for {task_id}: {validation.errors}")
+            return None
+        try:
+            TaskDefinition.model_validate(validation.data["tasks"][0])
+        except Exception as exc:
+            self._fail_pipeline(sm, f"Invalid task definition for {task_id}: {exc}")
+            return None
+        return validation.data["tasks"][0]
+
+    def _ensure_valid_task_spec(self, sm: PipelineStateMachine, task_id: str) -> dict | None:
+        task_path = self._task_artifact_path(task_id, "in-progress") or self._task_artifact_path(task_id, "todo") or self._task_artifact_path(task_id, "done")
+        if task_path is None:
+            self._fail_pipeline(sm, f"No task spec found for {task_id}")
+            return None
+        return self._ensure_valid_task_artifact(sm, task_path, task_id)
+
     def _invoke_validated_stage(
         self,
         prompt: str,
@@ -1278,17 +1446,21 @@ class Dispatcher:
         last_validation = None
 
         for attempt in range(1 + max_retries):
-            # Clear stale output so we only read what this invocation writes
-            if output_path and output_path.exists():
-                output_path.unlink()
-
             # First attempt uses original prompt; retries use repair prompt
+            repair_source: Path | None = None
+            if output_path and output_path.exists():
+                repair_source = self._snapshot_invalid_artifact(stage, output_path, attempt)
+
             if attempt == 0:
                 invoke_prompt = prompt
             else:
                 invoke_prompt = self._build_repair_prompt(
-                    prompt, expected_type, last_validation, output_path, config
+                    prompt, expected_type, last_validation, output_path, config, repair_source
                 )
+
+            # Clear stale output so we only read what this invocation writes
+            if output_path and output_path.exists():
+                output_path.unlink()
 
             # On second retry, rotate lane session if configured
             if attempt >= 2 and rotate_on_retry and self.lanes:
@@ -1318,12 +1490,14 @@ class Dispatcher:
             else:
                 validation = self.validator.validate(result.raw_text, expected_type)
             last_result = result
-            last_validation = validation
 
             if validation.valid:
                 if attempt > 0:
                     self.tui.success(f"Validation repair succeeded on attempt {attempt + 1}")
                 return result, validation
+
+            stop_retry_reason = self._stop_retry_reason(last_validation, validation, attempt)
+            last_validation = validation
 
             # Persist validation failure snapshot
             if self._persist_validation_failures(config):
@@ -1332,6 +1506,15 @@ class Dispatcher:
 
             if invocation_error:
                 self.tui.error(f"Stopping {stage} without retry because the failure is non-recoverable.")
+                break
+
+            unrecoverable_validation = self._nonrecoverable_validation_error(validation, expected_type)
+            if unrecoverable_validation:
+                self.tui.error(f"Stopping {stage} without retry because the validation failure is non-recoverable: {unrecoverable_validation}")
+                break
+
+            if stop_retry_reason:
+                self.tui.warning(f"Stopping retries for {stage}: {stop_retry_reason}")
                 break
 
             if attempt < max_retries:
@@ -1348,6 +1531,19 @@ class Dispatcher:
             return "Non-recoverable agent invocation failure: authentication was rejected"
         return None
 
+    def _nonrecoverable_validation_error(self, validation: ValidationResult, expected_type: str) -> str | None:
+        """Return a message when a validation failure should fail fast instead of retrying."""
+        if validation.valid:
+            return None
+        if expected_type not in SCHEMAS:
+            return f"unknown expected schema type '{expected_type}'"
+        joined = " ".join(validation.errors).lower()
+        if "unknown artifact type:" in joined and "got" not in joined:
+            return validation.errors[0]
+        if "required artifact missing before continuing" in joined:
+            return validation.errors[0]
+        return None
+
     def _build_repair_prompt(
         self,
         original_prompt: str,
@@ -1355,6 +1551,7 @@ class Dispatcher:
         validation: ValidationResult | None,
         output_path: Path | None,
         config: dict | None = None,
+        repair_source: Path | None = None,
     ) -> str:
         """Build a targeted repair prompt from validation errors."""
         errors = validation.errors if validation else ["Unknown validation error"]
@@ -1372,6 +1569,12 @@ class Dispatcher:
                     pass
 
         output_instruction = f"\nWrite the corrected YAML to: {output_path}" if output_path else ""
+        repair_instruction = (
+            f"\nBase your fix on the last invalid artifact at: {repair_source}\n"
+            "Make the smallest possible correction. Preserve unchanged content, ordering, and IDs unless a validation error explicitly requires changing them."
+            if repair_source else
+            "\nMake the smallest possible correction. Preserve unchanged content and structure wherever possible."
+        )
         original_block = f"\n\nOriginal task instructions:\n{original_prompt}" if original_prompt else ""
 
         return (
@@ -1379,9 +1582,41 @@ class Dispatcher:
             f"Fix the following errors and rewrite the complete YAML artifact:\n\n"
             f"Validation errors:\n{error_text}\n"
             f"{contract_hint}\n"
+            f"{repair_instruction}\n"
             f"{original_block}\n"
             f"IMPORTANT: Output ONLY valid YAML starting with ---. No prose.{output_instruction}"
         )
+
+    def _snapshot_invalid_artifact(self, stage: str, output_path: Path, attempt: int) -> Path | None:
+        """Persist the last invalid artifact so retries can patch it instead of regenerating it."""
+        if not output_path.exists() or not self.feature_dir:
+            return None
+        failures_dir = self.feature_dir / "validation-failures"
+        failures_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = failures_dir / f"{stage}-attempt-{attempt + 1}-input.yaml"
+        try:
+            shutil.copyfile(output_path, snapshot_path)
+            return snapshot_path
+        except OSError:
+            return None
+
+    def _stop_retry_reason(
+        self,
+        previous_validation: ValidationResult | None,
+        current_validation: ValidationResult,
+        attempt: int,
+    ) -> str | None:
+        """Fail fast when another retry is unlikely to change the outcome."""
+        if previous_validation is None:
+            return None
+        if previous_validation.valid or current_validation.valid:
+            return None
+        # Keep one more path available for recovery, including lane rotation.
+        if attempt < 2:
+            return None
+        if previous_validation.errors == current_validation.errors and previous_validation.data == current_validation.data:
+            return "the previous retry produced the same invalid artifact with no validation progress"
+        return None
 
     def _record_validation_failure(
         self,
@@ -1456,6 +1691,15 @@ class Dispatcher:
             session_id, is_resume = self.lanes.resolve_session(stage, task_id)
 
         timeout = self._stage_timeout(config)
+        self._update_status(
+            active_stage=stage,
+            active_task_id=task_id or "",
+            active_lane=lane_name or "",
+            active_agent=agent_name or "",
+            active_session_id=session_id,
+            stage_started_at=_now_iso(),
+        )
+        self._persist_v2_state()
         invocation = AgentInvocation(
             prompt=prompt,
             timeout=timeout,
@@ -1466,12 +1710,19 @@ class Dispatcher:
             max_budget_usd=budget_usd,
             lane_name=lane_name,
         )
-        self.tui.set_invocation_context(lane=lane_name, owner_agent=agent_name or "", task_id=task_id)
+        self.tui.set_invocation_context(
+            lane=lane_name,
+            owner_agent=agent_name or "",
+            task_id=task_id,
+            claude_session_id=session_id,
+        )
+        if agent_name:
+            self.tui.update_activity(agent_name, "", "preparing stage")
 
         def _status_callback(activities):
             if activities:
                 latest = activities[-1]
-                self.tui.update_activity(latest.actor, latest.summary)
+                self.tui.update_activity(latest.actor, latest.tool_name, latest.summary)
             else:
                 self.tui.update_activity()
 
@@ -1513,7 +1764,15 @@ class Dispatcher:
         self._raise_if_cancelled()
         self.total_cost_usd += result.cost_usd
         self.tui.cost_update(self.total_cost_usd)
-        self._update_status(total_cost_usd=self.total_cost_usd)
+        self._update_status(
+            total_cost_usd=self.total_cost_usd,
+            active_stage=stage,
+            active_task_id=task_id or "",
+            active_lane=lane_name or "",
+            active_agent=agent_name or "",
+            active_session_id=session_id,
+            last_stage_result_at=_now_iso(),
+        )
         # v2: record cost to lane and budget, persist at checkpoint
         if self.lanes and lane_name:
             self.lanes.record_cost(stage, task_id, result.cost_usd)
@@ -1579,12 +1838,23 @@ class Dispatcher:
                 })
                 failures.append(f"{criterion.get('id', 'unknown')}: {parse_error}")
                 continue
-            proc = subprocess.run(
-                parsed_command,
-                cwd=str(self.project_dir),
-                capture_output=True,
-                text=True,
-            )
+            try:
+                proc = subprocess.run(
+                    parsed_command,
+                    cwd=str(self.project_dir),
+                    capture_output=True,
+                    text=True,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                message = f"command execution error: {exc}"
+                checks.append({
+                    "name": criterion.get("id", command),
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "error_message": message,
+                })
+                failures.append(f"{criterion.get('id', 'unknown')}: {message}")
+                continue
             checks.append({
                 "name": criterion.get("id", command),
                 "status": "passed" if proc.returncode == 0 else "failed",
@@ -2178,6 +2448,7 @@ def _cancel_pipeline(args, xpatcher_home):
     sm.transition(PipelineStage.CANCELLED)
     state_file.update(status="cancelled", gate_reason="", cancelled_at=_now_iso())
 
+    _kill_dispatcher_process(feature_dir)
     # Kill orphaned Claude CLI processes
     _kill_session_processes(feature_dir)
 
@@ -2185,13 +2456,63 @@ def _cancel_pipeline(args, xpatcher_home):
     return 0
 
 
+def _collect_pipeline_session_ids(feature_dir: Path) -> set[str]:
+    """Collect all known Claude session IDs for a pipeline across v1 and v2 state."""
+    session_ids: set[str] = set()
+
+    sessions_path = feature_dir / "sessions.yaml"
+    if sessions_path.exists():
+        sessions_data = load_yaml_file(sessions_path)
+        for sid in sessions_data.get("sessions", {}):
+            if sid:
+                session_ids.add(str(sid))
+
+    state_path = feature_dir / "pipeline-state.yaml"
+    if state_path.exists():
+        state = load_yaml_file(state_path)
+        active_session_id = state.get("active_session_id")
+        if active_session_id:
+            session_ids.add(str(active_session_id))
+        lane_sessions = state.get("lane_sessions", {})
+        if isinstance(lane_sessions, dict):
+            for lane_state in lane_sessions.values():
+                if isinstance(lane_state, dict) and lane_state.get("session_id"):
+                    session_ids.add(str(lane_state["session_id"]))
+
+    lanes_dir = feature_dir / "lanes"
+    if lanes_dir.exists():
+        for lane_path in lanes_dir.glob("lane-*.yaml"):
+            lane_state = load_yaml_file(lane_path)
+            if lane_state.get("session_id"):
+                session_ids.add(str(lane_state["session_id"]))
+
+    return {sid for sid in session_ids if sid}
+
+
+def _kill_dispatcher_process(feature_dir: Path) -> None:
+    """Kill the dispatcher process recorded for a pipeline, if it still exists."""
+    state_path = feature_dir / "pipeline-state.yaml"
+    if not state_path.exists():
+        return
+    state = load_yaml_file(state_path)
+    try:
+        pid = int(state.get("dispatcher_pid", 0))
+    except (TypeError, ValueError):
+        return
+    if pid <= 0:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"  Killed dispatcher {pid}")
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
+
+
 def _kill_session_processes(feature_dir: Path) -> None:
     """Kill any Claude CLI processes associated with sessions in this pipeline."""
-    sessions_path = feature_dir / "sessions.yaml"
-    if not sessions_path.exists():
-        return
-    sessions_data = load_yaml_file(sessions_path)
-    for sid in sessions_data.get("sessions", {}):
+    for sid in sorted(_collect_pipeline_session_ids(feature_dir)):
         try:
             ps = subprocess.run(
                 ["pgrep", "-f", sid],
@@ -2222,6 +2543,7 @@ def _delete_pipeline(args, xpatcher_home):
         state_file.update(status="cancelled")
         print(f"  Cancelled running pipeline")
 
+    _kill_dispatcher_process(feature_dir)
     _kill_session_processes(feature_dir)
 
     # 2. Read branch name before deleting state

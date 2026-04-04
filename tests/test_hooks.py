@@ -45,7 +45,21 @@ class TestPreToolUseHook:
         assert code == 0
 
     def test_read_only_agent_blocked_from_edit(self):
-        output, code = run_hook("Edit", {"file_path": "/foo.py"}, agent_name="planner")
+        output, code = run_hook("Edit", {"file_path": "/foo.py"}, agent_name="plan-reviewer")
+        assert output["decision"] == "block"
+        assert code == 2
+
+    def test_planner_allowed_edit_xpatcher_artifact(self):
+        output, code = run_hook(
+            "Edit",
+            {"file_path": "/tmp/home/.xpatcher/projects/demo/plan-v2.yaml"},
+            agent_name="planner",
+        )
+        assert output["decision"] == "allow"
+        assert code == 0
+
+    def test_planner_blocked_edit_project_code(self):
+        output, code = run_hook("Edit", {"file_path": "/project/src/main.py"}, agent_name="planner")
         assert output["decision"] == "block"
         assert code == 2
 
@@ -58,6 +72,21 @@ class TestPreToolUseHook:
         output, code = run_hook("Read", {"file_path": "/foo.py"}, agent_name="planner")
         assert output["decision"] == "allow"
         assert code == 0
+
+    def test_planner_blocked_from_reading_env_files(self):
+        output, code = run_hook("Read", {"file_path": "/project/.env"}, agent_name="planner")
+        assert output["decision"] == "block"
+        assert code == 2
+
+    def test_reviewer_blocked_from_reading_backup_data(self):
+        output, code = run_hook("Grep", {"path": "/project/data_backup_20260329"}, agent_name="plan-reviewer")
+        assert output["decision"] == "block"
+        assert code == 2
+
+    def test_planner_blocked_from_broad_recursive_glob(self):
+        output, code = run_hook("Glob", {"pattern": "**/*.py", "path": "/project"}, agent_name="planner")
+        assert output["decision"] == "block"
+        assert code == 2
 
     def test_planner_allowed_bash_git(self):
         output, code = run_hook("Bash", {"command": "git log --oneline"}, agent_name="planner")

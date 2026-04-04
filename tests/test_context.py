@@ -71,6 +71,28 @@ class TestPromptBuilder:
         assert str(builder.feature_dir) in writer_prompt
         assert "${" not in planner_prompt + executor_prompt + writer_prompt
 
+    def test_v2_prompts_bias_existing_context_and_no_subagents(self, tmp_path):
+        builder = _make_builder(tmp_path)
+        builder.v2_mode = True
+        (builder.feature_dir / "intent.yaml").write_text(yaml.dump({"goal": "Add login flow"}))
+        (builder.feature_dir / "plan-v1.yaml").write_text(yaml.dump({"type": "plan"}))
+        (builder.feature_dir / "plan-review-v1.yaml").write_text(yaml.dump({"type": "plan_review"}))
+        (builder.feature_dir / "task-manifest.yaml").write_text(yaml.dump({"type": "task_manifest"}))
+        (builder.feature_dir / "task-review-v1.yaml").write_text(yaml.dump({"type": "task_manifest_review"}))
+        out = builder.feature_dir / "out.yaml"
+
+        intent_prompt = builder.build_intent_capture("desc", out, timeout=900)
+        planner_prompt = builder.build_planner(out, timeout=900)
+        task_prompt = builder.build_task_breakdown(1, out, timeout=900)
+
+        assert str(builder.feature_dir / "context" / "feature-brief.yaml") in intent_prompt
+        assert "Do not use the Agent tool for this stage." in intent_prompt
+        assert str(builder.feature_dir / "context" / "repo-inventory.yaml") in planner_prompt
+        assert str(builder.feature_dir / "context" / "implementation-scout.yaml") in planner_prompt
+        assert "Avoid recursive codebase globs" in planner_prompt
+        assert "Do not use the Agent tool for this stage." in planner_prompt
+        assert str(builder.feature_dir / "context" / "manifest-packet-v1.yaml") in task_prompt
+
     def test_every_prompt_contains_time_constraint_with_correct_timeout(self, tmp_path):
         """Every build_* method injects current_time and timeout_minutes into the prompt."""
         builder = _make_builder(tmp_path)

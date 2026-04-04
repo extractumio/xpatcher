@@ -268,16 +268,47 @@ PATH_LINE="export PATH=\"$INSTALL_DIR/bin:\$PATH\""
 # to cover interactive login shells and non-login interactive shells.
 for rcfile in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.zprofile"; do
     [ -f "$rcfile" ] || continue
-    if ! grep -qF "$INSTALL_DIR/bin" "$rcfile"; then
-        printf '\n# xpatcher\n%s\n' "$PATH_LINE" >> "$rcfile"
-        ok "Added to PATH in $(basename "$rcfile")"
-    else
-        ok "PATH already configured in $(basename "$rcfile")"
-    fi
+    XPATCHER_RCFILE="$rcfile" XPATCHER_PATH_LINE="$PATH_LINE" python3 - <<'PY'
+import os
+from pathlib import Path
+rc = Path(os.environ["XPATCHER_RCFILE"])
+path_line = os.environ["XPATCHER_PATH_LINE"]
+lines = rc.read_text().splitlines()
+out = []
+skip_next = False
+changed = False
+for i, line in enumerate(lines):
+    if skip_next:
+        skip_next = False
+        changed = True
+        continue
+    if line.strip() == "# xpatcher":
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if "xpatcher" in next_line and "export PATH=" in next_line:
+            skip_next = True
+            changed = True
+            continue
+    out.append(line)
+block = ["# xpatcher", path_line]
+if out[-2:] != block:
+    if out and out[-1].strip():
+        out.append("")
+    out.extend(block)
+    changed = True
+if changed:
+    rc.write_text("\\n".join(out) + "\\n")
+PY
+    ok "PATH configured in $(basename "$rcfile")"
 done
 
 # Make it available in the current session too
 export PATH="$INSTALL_DIR/bin:$PATH"
+
+ACTIVE_XPATCHER="$(command -v xpatcher 2>/dev/null || true)"
+if [ -n "$ACTIVE_XPATCHER" ] && [ "$ACTIVE_XPATCHER" != "$INSTALL_DIR/bin/xpatcher" ]; then
+    warn "Another xpatcher is earlier in PATH: $ACTIVE_XPATCHER"
+    info "Open a new shell or run: export PATH=\"$INSTALL_DIR/bin:\$PATH\""
+fi
 
 # ---------------------------------------------------------------------------
 # Done
